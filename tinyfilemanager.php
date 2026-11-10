@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.1
+ * Tiny File Manager++ 1.0.2
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.1');
+define('VERSION', '1.0.2');
 
 //Application Title
 define('APP_TITLE', 'Tiny File Manager++');
@@ -921,7 +921,7 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 ftruncate($fp, 0);
                 rewind($fp);
                 if ($ch) curl_close($ch);
-                $ch = curl_init($current);
+                $ch = curl_init($target['url']);
                 curl_setopt($ch, CURLOPT_RESOLVE, array($target['host'] . ':' . $target['port'] . ':' . (strpos($target['ip'], ':') !== false ? '[' . $target['ip'] . ']' : $target['ip'])));
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
                 curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
@@ -939,6 +939,14 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 $success = @curl_exec($ch);
                 $curl_info = curl_getinfo($ch);
                 $code = (int) $curl_info['http_code'];
+                // belt and braces: the connection must have gone to exactly the address that was checked
+                $used = isset($curl_info['primary_ip']) ? $curl_info['primary_ip'] : '';
+                if ($used !== '' && @inet_pton($used) !== @inet_pton($target['ip'])) {
+                    $success = false;
+                    $err = array("message" => 'The download went to an unexpected address and was discarded.');
+                    ftruncate($fp, 0);
+                    break;
+                }
                 if ($success && $code >= 300 && $code < 400 && $location !== null) {
                     if (++$hops > 5) {
                         $success = false;
@@ -7121,10 +7129,14 @@ function fm_first_run_setup()
  */
 function fm_url_target($url)
 {
+    // characters where PHP's parser and curl's can disagree about the host: refuse them outright
+    if (preg_match('/[\s\x00-\x1F\x7F\\\\]/', $url)) return 'That address contains characters that are not allowed.';
     $p = @parse_url($url);
     $scheme = isset($p['scheme']) ? strtolower($p['scheme']) : '';
     if (!$p || empty($p['host']) || !in_array($scheme, array('http', 'https'), true)) return 'Only http:// and https:// addresses can be downloaded.';
-    $host = strtolower(trim($p['host'], '[]'));
+    if (isset($p['user']) || isset($p['pass'])) return 'Addresses with a user name or password are not allowed.';
+    $host = rtrim(strtolower(trim($p['host'], '[]')), '.');
+    if ($host === '' || strpbrk($host, '%@/?#') !== false) return 'That address is not valid.';
     $port = isset($p['port']) ? (int) $p['port'] : ($scheme === 'https' ? 443 : 80);
     if (in_array($port, array(22, 23, 25, 110, 143, 465, 587, 993, 995, 3306, 5432, 6379, 11211, 27017), true)) return 'That port is not allowed.';
     $ips = array();
@@ -7141,14 +7153,34 @@ function fm_url_target($url)
     }
     if (!$ips) return 'The address could not be found. Check the domain name.';
     foreach ($ips as $ip) {
-        $check = $ip;
-        if (stripos($ip, '::ffff:') === 0 && filter_var(substr($ip, 7), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $check = substr($ip, 7); // IPv4-mapped IPv6
-        if (!filter_var($check, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)
-            || preg_match('/^(0\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|169\.254\.|f[cd]|fe[89ab])/i', $check)) {
-            return 'Addresses on private or internal networks are not allowed.';
-        }
+        if (!fm_ip_public($ip)) return 'Addresses on private or internal networks are not allowed.';
     }
-    return array('host' => $host, 'port' => $port, 'ip' => $ips[0]);
+    // the address curl will receive, rebuilt from the checked parts only, so both parsers see the same host
+    $clean = $scheme . '://' . (strpos($host, ':') !== false ? '[' . $host . ']' : $host) . ':' . $port
+        . (isset($p['path']) ? $p['path'] : '/') . (isset($p['query']) ? '?' . $p['query'] : '');
+    return array('host' => $host, 'port' => $port, 'ip' => $ips[0], 'url' => $clean);
+}
+
+/**
+ * Is this a public internet address? Checked in binary form. IPv6: only global unicast (2000::/3), without the
+ * ranges that embed or tunnel an IPv4 address (6to4 2002::/16, Teredo 2001::/32) or are for documentation; this also
+ * rules out ::1, ::a.b.c.d, NAT64 64:ff9b::/96, fc00::/7 and fe80::/10. IPv4-mapped (::ffff:a.b.c.d) is checked as IPv4
+ */
+function fm_ip_public($ip)
+{
+    $b = @inet_pton($ip);
+    if ($b === false) return false;
+    if (strlen($b) === 16) {
+        if (substr($b, 0, 12) === str_repeat("\0", 10) . "\xff\xff") return fm_ip_public(inet_ntop(substr($b, 12)));
+        if ((ord($b[0]) & 0xE0) !== 0x20) return false;
+        $p4 = substr($b, 0, 4);
+        if (substr($b, 0, 2) === "\x20\x02" || $p4 === "\x20\x01\x00\x00" || $p4 === "\x20\x01\x0d\xb8") return false;
+        return (bool) filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE);
+    }
+    $ip = inet_ntop($b);
+    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) return false;
+    // also: this-network, carrier-grade NAT, link-local, IETF protocol assignments, benchmarking, multicast and reserved
+    return !preg_match('/^(0\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|169\.254\.|192\.0\.0\.|198\.1[89]\.|22[4-9]\.|2[3-5]\d\.)/', $ip);
 }
 
 /** Resolve a redirect's Location against the address it came from */

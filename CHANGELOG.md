@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.2 — security fix
+
+- **Upload from URL (SSRF, parser differences).** Addresses with a user name, backslashes, spaces, control characters
+  or an encoded host are refused, a trailing dot is ignored, and curl now receives an address rebuilt from the checked
+  parts, so PHP and curl always agree on the host. After each request the connected IP must equal the checked one,
+  otherwise the download is discarded.
+- **Upload from URL (IPv6 forms).** Addresses are checked in binary form: IPv6 only within global unicast
+  (2000::/3), excluding 6to4, Teredo and documentation ranges, which also rules out NAT64 (64:ff9b::/96),
+  IPv4-compatible, unique-local and link-local addresses; IPv4-mapped addresses are checked as IPv4. IPv4 additionally
+  excludes CGNAT, link-local, benchmarking, multicast and reserved ranges.
+
 ## 1.0.1 — security fixes
 
 - **Settings are for admins only.** Full-access users with an own folder can no longer open Settings, the server
