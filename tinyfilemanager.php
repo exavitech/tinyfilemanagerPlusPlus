@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.0
+ * Tiny File Manager++ 1.0.1
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.0');
+define('VERSION', '1.0.1');
 
 //Application Title
 define('APP_TITLE', 'Tiny File Manager++');
@@ -524,7 +524,13 @@ defined('FM_DOC_VIEWER') || define('FM_DOC_VIEWER', $online_viewer);
 define('FM_READONLY', $global_readonly || ($use_auth && !empty($readonly_users) && isset($_SESSION[FM_SESSION_ID]['logged']) && in_array($_SESSION[FM_SESSION_ID]['logged'], $readonly_users)));
 define('FM_IS_WIN', DIRECTORY_SEPARATOR == '\\');
 // Settings: any full-access user (also while "read-only for everyone" is on, so it can be switched off again)
-define('FM_CAN_CONFIGURE', $use_auth ? (isset($_SESSION[FM_SESSION_ID]['logged']) && !in_array($_SESSION[FM_SESSION_ID]['logged'], (array) $readonly_users, true)) : !$global_readonly);
+// Settings (and with it users, the server browser and server tools): admins only, i.e. full-access users WITHOUT
+// an own folder. A user limited to a folder must not be able to change the root, other accounts or run commands
+define('FM_CAN_CONFIGURE', $use_auth
+    ? (isset($_SESSION[FM_SESSION_ID]['logged'])
+        && !in_array($_SESSION[FM_SESSION_ID]['logged'], (array) $readonly_users, true)
+        && empty($directories_users[$_SESSION[FM_SESSION_ID]['logged']]))
+    : !$global_readonly);
 // the Environment page and its endpoints exist only when switched on (Settings > Access > Server tools)
 define('FM_SERVER_TOOLS', FM_CAN_CONFIGURE && !empty($server_tools));
 
@@ -562,7 +568,11 @@ unset($p, $use_auth, $iconv_input_encoding, $use_highlightjs, $highlightjs_style
 
 // Hidden items (Settings > Files) stay hidden everywhere: nothing inside a hidden folder can be listed,
 // opened, downloaded, edited, renamed, deleted, copied, moved, extracted or searched, even by a direct link
-if (!(isset($_POST['type']) && in_array($_POST['type'], array('settings_browse', 'settings_all'), true))) {
+// The only exemption: an admin's genuine Settings request (ajax + valid token). Such a request always reaches the
+// Settings handler in the ajax block, which answers and exits before any file action or page can run.
+$fm_settings_req = FM_CAN_CONFIGURE && isset($_POST['ajax'], $_POST['token'], $_POST['type'])
+    && in_array($_POST['type'], array('settings_browse', 'settings_all'), true) && verifyToken($_POST['token']);
+if (!$fm_settings_req) {
     $hidden_hit = fm_path_hidden(FM_PATH);
     $in_folder = array(); // names relative to the open folder
     foreach (array('view', 'edit', 'dl', 'del', 'chmod', 'raw') as $k) {
@@ -862,25 +872,15 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
 
         $url = !empty($_REQUEST["uploadurl"]) && preg_match("|^http(s)?://.+$|", stripslashes($_REQUEST["uploadurl"])) ? stripslashes($_REQUEST["uploadurl"]) : null;
 
-        //prevent 127.* domain and known ports
-        $domain = parse_url($url, PHP_URL_HOST);
-        $port = parse_url($url, PHP_URL_PORT);
-        $knownPorts = [22, 23, 25, 3306];
-
-        if (preg_match("/^localhost$|^127(?:\.[0-9]+){0,2}\.[0-9]+$|^(?:0*\:)*?:?0*1$/i", $domain) || in_array($port, $knownPorts)) {
-            $err = array("message" => "URL is not allowed");
-            event_callback(array("fail" => $err));
+        // only public http(s) addresses; checked again for every redirect below (no internal services, no cloud metadata)
+        $target = $url ? fm_url_target($url) : 'Enter an http:// or https:// address.';
+        if (!is_array($target)) {
+            event_callback(array("fail" => array("message" => $target)));
             exit();
         }
-        // also refuse names that resolve to private or reserved networks (internal services, cloud metadata)
-        $resolved = $domain ? @gethostbynamel($domain) : false;
-        if ($resolved) {
-            foreach ($resolved as $ip) {
-                if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
-                    event_callback(array("fail" => array("message" => "Addresses on private or internal networks are not allowed.")));
-                    exit();
-                }
-            }
+        if (!function_exists('curl_init')) {
+            event_callback(array("fail" => array("message" => 'Uploading from an address needs the PHP curl extension on this server.')));
+            exit();
         }
 
         // allow_url_fopen is often switched off; cURL works either way
@@ -905,21 +905,52 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             $success = false;
         } else if ($use_curl) {
             @$fp = fopen($temp_file, "w");
-            @$ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-            curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
-            // http(s) only, also after redirects
-            curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-            curl_setopt($ch, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-            // an HTTP error is a failure, not a file to save
-            curl_setopt($ch, CURLOPT_FAILONERROR, true);
-            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 600);
-            curl_setopt($ch, CURLOPT_USERAGENT, 'TinyFileManagerPlusPlus/' . VERSION);
-            curl_setopt($ch, CURLOPT_FILE, $fp);
-            @$success = curl_exec($ch);
-            $curl_info = curl_getinfo($ch);
-            if (!$success) {
+            // redirects are followed here, not by curl, so every hop is checked; each request is pinned to the
+            // address that was checked (CURLOPT_RESOLVE), so a DNS answer can't change in between (DNS rebinding)
+            $current = $url;
+            $hops = 0;
+            $ch = null;
+            $success = false;
+            while (true) {
+                $target = fm_url_target($current);
+                if (!is_array($target)) {
+                    $success = false; // a refused redirect ends the download, even after a good first hop
+                    $err = array("message" => $target);
+                    break;
+                }
+                ftruncate($fp, 0);
+                rewind($fp);
+                if ($ch) curl_close($ch);
+                $ch = curl_init($current);
+                curl_setopt($ch, CURLOPT_RESOLVE, array($target['host'] . ':' . $target['port'] . ':' . (strpos($target['ip'], ':') !== false ? '[' . $target['ip'] . ']' : $target['ip'])));
+                curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
+                curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+                // an HTTP error is a failure, not a file to save
+                curl_setopt($ch, CURLOPT_FAILONERROR, true);
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 600);
+                curl_setopt($ch, CURLOPT_USERAGENT, 'TinyFileManagerPlusPlus/' . VERSION);
+                curl_setopt($ch, CURLOPT_FILE, $fp);
+                $location = null;
+                curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($c, $header) use (&$location) {
+                    if (preg_match('/^Location:\s*(\S+)/i', trim($header), $m)) $location = $m[1];
+                    return strlen($header);
+                });
+                $success = @curl_exec($ch);
+                $curl_info = curl_getinfo($ch);
+                $code = (int) $curl_info['http_code'];
+                if ($success && $code >= 300 && $code < 400 && $location !== null) {
+                    if (++$hops > 5) {
+                        $success = false;
+                        $err = array("message" => 'The address redirects too many times.');
+                        break;
+                    }
+                    $current = fm_url_resolve($current, $location);
+                    continue;
+                }
+                break;
+            }
+            if (!$success && !$err && $ch) {
                 $code = (int) $curl_info['http_code'];
                 $curl_err = curl_errno($ch);
                 $status_names = array(400 => 'Bad Request', 401 => 'Unauthorized', 403 => 'Forbidden', 404 => 'Not Found', 410 => 'Gone', 429 => 'Too Many Requests', 500 => 'Internal Server Error', 502 => 'Bad Gateway', 503 => 'Service Unavailable', 504 => 'Gateway Timeout');
@@ -938,10 +969,10 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 }
                 $err = array("message" => $msg);
             }
-            @curl_close($ch);
+            if ($ch) @curl_close($ch);
             fclose($fp);
-            $fileinfo->size = $curl_info["size_download"];
-            $fileinfo->type = $curl_info["content_type"];
+            $fileinfo->size = isset($curl_info) ? $curl_info["size_download"] : 0;
+            $fileinfo->type = isset($curl_info) ? $curl_info["content_type"] : '';
         } else {
             $ctx = stream_context_create();
             @$success = copy($url, $temp_file, $ctx);
@@ -2413,7 +2444,7 @@ if (isset($_GET['settings']) && FM_CAN_CONFIGURE) {
                 <section class="fm-set-panel" id="fm-set-p-users" data-tab="users" role="tabpanel" aria-labelledby="fm-set-t-users" data-search="users user accounts account password read-only folder sign in" hidden>
                     <header class="fm-set-panel-head">
                         <h2><i class="fa fa-users" aria-hidden="true"></i>Users</h2>
-                        <p>Accounts that can sign in. Passwords are stored only as hashes, so nobody can read them back.</p>
+                        <p>Accounts that can sign in. Only full-access users without an own folder can open Settings.</p>
                     </header>
                     <?php if (!FM_USE_AUTH): ?>
                         <div class="fm-set-note is-warn"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i><span>Sign-in is off (Security tab), so these accounts aren't asked for right now.</span></div>
@@ -7084,6 +7115,53 @@ function fm_first_run_setup()
     exit;
 }
 
+/**
+ * Check an address for "upload from URL": http(s) only, no mail/database ports, and every address the name resolves
+ * to (A and AAAA) must be public. Returns array(host, port, ip) to pin the request to, or an error message.
+ */
+function fm_url_target($url)
+{
+    $p = @parse_url($url);
+    $scheme = isset($p['scheme']) ? strtolower($p['scheme']) : '';
+    if (!$p || empty($p['host']) || !in_array($scheme, array('http', 'https'), true)) return 'Only http:// and https:// addresses can be downloaded.';
+    $host = strtolower(trim($p['host'], '[]'));
+    $port = isset($p['port']) ? (int) $p['port'] : ($scheme === 'https' ? 443 : 80);
+    if (in_array($port, array(22, 23, 25, 110, 143, 465, 587, 993, 995, 3306, 5432, 6379, 11211, 27017), true)) return 'That port is not allowed.';
+    $ips = array();
+    if (filter_var($host, FILTER_VALIDATE_IP)) {
+        $ips[] = $host;
+    } else {
+        foreach ((array) @dns_get_record($host, DNS_A | DNS_AAAA) as $r) {
+            if (!empty($r['ip'])) $ips[] = $r['ip'];
+            if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
+        }
+        foreach ((array) @gethostbynamel($host) as $ip) {
+            if ($ip && !in_array($ip, $ips, true)) $ips[] = $ip; // also /etc/hosts entries
+        }
+    }
+    if (!$ips) return 'The address could not be found. Check the domain name.';
+    foreach ($ips as $ip) {
+        $check = $ip;
+        if (stripos($ip, '::ffff:') === 0 && filter_var(substr($ip, 7), FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) $check = substr($ip, 7); // IPv4-mapped IPv6
+        if (!filter_var($check, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)
+            || preg_match('/^(0\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|169\.254\.|f[cd]|fe[89ab])/i', $check)) {
+            return 'Addresses on private or internal networks are not allowed.';
+        }
+    }
+    return array('host' => $host, 'port' => $port, 'ip' => $ips[0]);
+}
+
+/** Resolve a redirect's Location against the address it came from */
+function fm_url_resolve($base, $location)
+{
+    if (preg_match('#^https?://#i', $location)) return $location;
+    $b = parse_url($base);
+    $origin = $b['scheme'] . '://' . $b['host'] . (isset($b['port']) ? ':' . $b['port'] : '');
+    if (substr($location, 0, 2) === '//') return $b['scheme'] . ':' . $location;
+    if ($location !== '' && $location[0] === '/') return $origin . $location;
+    return $origin . (isset($b['path']) ? preg_replace('#/[^/]*$#', '/', $b['path']) : '/') . $location;
+}
+
 /* ======================= Settings (settings.php) ======================= */
 
 /**
@@ -7689,17 +7767,20 @@ function fm_settings_save_request($in)
             $users[$name] = array('hash' => $hash, 'readonly' => !empty($u['readonly']), 'dir' => $dir);
         }
         if (empty($errors['users'])) {
+            // admins: full access and no own folder (only they can open Settings)
             $full = array_filter($users, function ($u) {
-                return !$u['readonly'];
+                return !$u['readonly'] && $u['dir'] === '';
             });
             if (!$users) {
                 $errors['users'] = 'Keep at least one user.';
             } elseif (!$full) {
-                $errors['users'] = 'Keep at least one user with full access.';
+                $errors['users'] = 'Keep at least one user with full access and no own folder: only they can open Settings.';
             } elseif ($me !== null && FM_USE_AUTH && !isset($users[$me])) {
                 $errors['users'] = 'You can\'t remove your own account while signed in with it.';
             } elseif ($me !== null && FM_USE_AUTH && $users[$me]['readonly']) {
                 $errors['users'] = 'You can\'t make your own account read-only.';
+            } elseif ($me !== null && FM_USE_AUTH && $users[$me]['dir'] !== '') {
+                $errors['users'] = 'You can\'t give your own account its own folder: it would lose access to Settings.';
             }
         }
     }

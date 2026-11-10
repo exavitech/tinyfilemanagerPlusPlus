@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.1 — security fixes
+
+- **Settings are for admins only.** Full-access users with an own folder can no longer open Settings, the server
+  browser, image previews or server tools. Before, they could change the root folder, other users' passwords or
+  switch on server tools, and so escape their folder. An admin is a full-access user without an own folder; at
+  least one must remain, and you can't give your own account a folder.
+- **Upload from URL (SSRF).** Redirects are now followed by the app and every hop is checked (http/https only,
+  blocked ports, all A and AAAA addresses must be public, including IPv4-mapped IPv6, CGNAT and link-local), and each
+  request is pinned to the checked address, which also stops DNS rebinding. Without the curl extension the feature
+  is refused instead of following unchecked redirects.
+- **Hidden items.** A request could skip the hidden-items check by adding `type=settings_all` (with or without
+  `ajax`); the check is now only skipped for an admin's Settings request with a valid token, which always finishes
+  before any file action or page can run.
+
 ## 1.0.0 — Tiny File Manager++ (fork of Tiny File Manager 2.6)
 
 ### Added
