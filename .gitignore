@@ -1,0 +1,11 @@
+# written by the app at run time: users, password hashes and settings
+settings.php
+settings.php.tmp*
+passwords.php
+config.php
+config.php.migrated-*
+*.fmtmp
+
+# Docker volumes from docker-compose.yml
+data/
+tfm-config/

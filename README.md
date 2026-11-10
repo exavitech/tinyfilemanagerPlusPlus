@@ -1,75 +1,93 @@
-# Tiny File Manager
+# Tiny File Manager++
 
-[![Live demo](https://img.shields.io/badge/Live-Demo-brightgreen.svg?style=flat-square)](https://tinyfilemanager.github.io/demo/)
-[![Live demo](https://img.shields.io/badge/Help-Docs-lightgrey.svg?style=flat-square)](https://github.com/prasathmani/tinyfilemanager/wiki)
-[![GitHub Release](https://img.shields.io/github/release/prasathmani/tinyfilemanager.svg?style=flat-square)](https://github.com/prasathmani/tinyfilemanager/releases)
-[![GitHub License](https://img.shields.io/github/license/prasathmani/tinyfilemanager.svg?style=flat-square)](https://github.com/prasathmani/tinyfilemanager/blob/master/LICENSE)
-[![Paypal](https://img.shields.io/badge/Donate-Paypal-lightgrey.svg?style=flat-square)](https://www.paypal.me/prasathmani)
-![GitHub Sponsors](https://img.shields.io/github/sponsors/prasathmani)
+A web file manager in a **single PHP file**, rebuilt on top of [Tiny File Manager](https://github.com/prasathmani/tinyfilemanager) with a new interface, a full settings page and safer defaults.
 
-> TinyFileManager is a versatile web-based PHP file manager designed for simplicity and efficiency. This lightweight single-file PHP application can be effortlessly integrated into any server directory, allowing users to store, upload, edit, and manage files and folders directly through their web browser.
-With multi-language support and compatibility with PHP 5.5+, TinyFileManager enables the creation of individual user accounts, each with its dedicated directory. The platform also includes built-in functionality for handling text files using the Cloud9 IDE.
-Featuring syntax highlighting for over 150 languages and more than 35 themes, TinyFileManager offers a comprehensive solution for file management in an online environment.
+Drop `tinyfilemanager.php` on a PHP server, open it, create the admin account and manage files. Everything else — settings, users, passwords — is done from the browser and saved in a small `settings.php` next to it. `tinyfilemanager.php` itself never changes.
 
-<sub>**Caution!** _Avoid utilizing this script as a standard file manager in public spaces. It is imperative to remove this script from the server after completing any tasks._</sub>
+![File list](docs/screenshots/files.png)
 
-## Demo
+## What's new compared with Tiny File Manager
 
-[Demo](https://tinyfilemanager.github.io/demo/)
+**Interface**
+- New light and dark theme, coloured icons and a compact layout that fits on one screen.
+- **Download** several files and folders as one zip, with a "Preparing download…" spinner.
+- Copy / move with a folder picker, styled dialogs, a better file view and editor page.
 
+**Settings page — no more editing PHP**
+- Every option from the top of the file, in side tabs: Appearance, Regional, Files, Uploads, Viewer & editor, Access, Network, Advanced and **Users**.
+- Each row shows its default, marks what you changed and can reset it; search across all tabs.
+- No typing of paths or lists: folders and images are picked with a server browser, IP lists, file types, hidden items and editor languages have their own editors with validation and quick-add groups.
+- Users: add and remove, read-only or full access, an own starting folder per user, passwords with a generator.
 
-## Documentation
+**Security**
+- **First-run setup** instead of a built-in default password: the first visit creates the admin account.
+- Change password page with a strength meter and generator; other sessions are signed out when a password changes.
+- Hidden items are enforced everywhere: nothing inside a hidden folder can be listed, opened, downloaded, renamed, deleted, copied or searched, even by a direct link. Patterns (`*.log`, `backup*`) and full paths work, in any case.
+- The app's own `settings.php` (password hashes) can never be shown or downloaded through the app.
+- Guards against locking yourself out (IP rules that would block you, removing your own account, read-only for everyone).
 
-Tinyfilemanager is highly documented on the [wiki pages](https://github.com/prasathmani/tinyfilemanager/wiki).
+**Server tools** (optional, off by default)
+- An **Environment** page: OS, CPU, memory, disks, web server and PHP, services and Docker containers, network ports, security (updates, firewall, fail2ban, SSH), processes.
+- **Scheduled jobs**: cron jobs and systemd timers with readable schedules, next and last run; disable, enable or delete cron jobs (a backup is kept).
+- **Logs**: system journal, `/var/log`, web server, PHP, databases and Docker containers — last N lines or last N hours, errors only, search, copy and download.
 
-[![Tiny File Manager](screenshot.gif)](screenshot.gif)
+**Deployment**
+- One file: default images are built in, an older `config.php` is migrated automatically.
+- `TFMPP_SETTINGS` can put `settings.php` anywhere, e.g. outside the web root or in a Docker volume.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![First-run setup](docs/screenshots/first-run-setup.png) | ![Settings](docs/screenshots/settings.png) |
+| ![List editor](docs/screenshots/settings-list-editor.png) | ![Change password](docs/screenshots/change-password.png) |
+| ![Dark theme](docs/screenshots/files-dark.png) | ![Users in the dark theme](docs/screenshots/settings-dark.png) |
 
 ## Requirements
 
-- PHP 5.5.0 or higher.
-- Fileinfo, iconv, zip, tar and mbstring extensions are strongly recommended.
+- PHP **7.2 or newer** (tested on 8.3) with the `session`, `json` and `fileinfo` extensions.
+- `zip` for zip archives and the zip download; `phar` for tar archives.
+- Server tools only: `shell_exec` allowed, and a Linux server. Viewing cron files, logs and switching jobs needs the PHP user to have the rights for them.
 
-## How to use
+## Install
 
-Download ZIP with latest version from master branch.
+1. Copy `tinyfilemanager.php` to your web server (rename it to `index.php` if you like).
+2. Open it in the browser and create the admin account.
+3. Open the account menu (top right) → **Settings** to adjust everything else.
 
-Just copy the tinyfilemanager.php to your webspace - thats all :)
-You can also change the file name from "tinyfilemanager.php" to something else, you know what i meant for.
+The folder next to the file must be writable by PHP so `settings.php` can be saved. To keep `settings.php` somewhere else, set the environment variable `TFMPP_SETTINGS` to its full path.
 
-Default username/password: **admin/admin@123** and **user/12345**.
+By default the root folder is the web server's document root. Change it under Settings → Files → Root folder.
 
-:warning: Warning: Please set your own username and password in `$auth_users` before use. password is encrypted with <code>password_hash()</code>. to generate new password hash [here](https://tinyfilemanager.github.io/docs/pwd.html)
+### Docker
 
-To enable/disable authentication set `$use_auth` to true or false.
+```bash
+docker compose up -d        # then open http://localhost:8080
+```
 
-:information_source: Add your own configuration file [config.php](https://tinyfilemanager.github.io/config-sample.txt) in the same folder to use as additional configuration file.
+Files go in `./data`, and `./tfm-config/settings.php` keeps users and settings across rebuilds (see `docker-compose.yml`).
 
-:information_source: To work offline without CDN resources, use [offline](https://github.com/prasathmani/tinyfilemanager/tree/offline) branch
+## Upgrading from Tiny File Manager
 
-### :loudspeaker: Features
+- Users in `$auth_users` keep working. Change passwords from the account menu and they move to `settings.php`.
+- A `config.php` next to the file is folded into `settings.php` on the first visit and renamed to `config.php.migrated-<date>`.
+- Everything set at the top of the PHP file still works as the default; values saved on the Settings page override it.
 
-- :cd: **Open Source:** Lightweight, minimalist, and extremely simple to set up.
-- :iphone: **Mobile Friendly:** Optimized for touch devices and mobile viewing.
-- :information_source: **Core Features:** Easily create, delete, modify, view, download, copy, and move files.
-- :arrow_double_up: **Advanced Upload Options:** Ajax-powered uploads with drag-and-drop support, URL imports, and multi-file uploads with extension filtering.
-- :file_folder: **Folder & File Management:** Create and organize folders and files effortlessly.
-- :gift: **Compression Tools:** Compress and extract files in `zip` and `tar` formats.
-- :sunglasses: **User Permissions:** User-specific root folder mapping and session-based access control.
-- :floppy_disk: **Direct URLs:** Easily copy direct URLs for files.
-- :pencil2: **Code Editor:** Includes Cloud9 IDE with syntax highlighting for 150+ languages and 35+ themes.
-- :page_facing_up: **Document Preview:** Google/Microsoft document viewer for PDF/DOC/XLS/PPT, supporting previews up to 25 MB.
-- :zap: **Security Features:** Backup capabilities, IP blacklisting, and whitelisting.
-- :mag_right: **Search Functionality:** Use `datatable.js` for fast file search and filtering.
-- :file_folder: **Customizable Listings:** Exclude specific folders and files from directory views.
-- :globe_with_meridians: **Multi-language Support:** Translations available in 35+ languages with `translation.json`.
-- :bangbang: **And Much More!**
+To return to the defaults, delete `settings.php` (this also removes users created on the Settings page).
 
-### [Deploy by Docker](https://github.com/prasathmani/tinyfilemanager/wiki/Deploy-by-Docker)
+## Security notes
 
-### <a name=license></a>License, Credit
+- Use HTTPS, and keep the root folder as narrow as possible. `/` gives every full-access user the whole server.
+- Leave **Server tools** off unless every full-access user may see and change the system.
+- Keep **Show PHP errors** off in production; error messages can reveal paths.
+- Report vulnerabilities privately, see [SECURITY.md](SECURITY.md).
 
-- Available under the [GNU license](https://github.com/prasathmani/tinyfilemanager/blob/master/LICENSE)
-- Original concept and development by github.com/alexantr/filemanager
-- CDN Used - _jQuery, Bootstrap, Font Awesome, Highlight js, ace js, DropZone js, and DataTable js_
-- To report a bug or request a feature, please file an [issue](https://github.com/prasathmani/tinyfilemanager/issues)
-- [Contributors](https://github.com/prasathmani/tinyfilemanager/wiki/Authors-and-Contributors)
+## Language
+
+The new screens are in English. Translations from `translation.json` still apply to the parts of the interface that come from Tiny File Manager.
+
+## Credits and license
+
+Tiny File Manager++ is a fork of **[Tiny File Manager](https://github.com/prasathmani/tinyfilemanager)** by Prasath Mani / CCP Programmers, and is released under the same license, the **GNU General Public License v3.0** — see [LICENSE](LICENSE).
+
+It uses [Bootstrap](https://getbootstrap.com), [jQuery](https://jquery.com), [Font Awesome 4](https://fontawesome.com/v4), [Ace editor](https://ace.c9.io), [highlight.js](https://highlightjs.org), [Dropzone](https://www.dropzone.dev) and [DataTables](https://datatables.net), loaded from public CDNs.
