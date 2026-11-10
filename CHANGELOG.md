@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3 — security fix
+
+- **Upload from URL (international names).** curl converts an international domain name to its `xn--` form, so the
+  address pin set for the original spelling did not apply and curl looked the name up again. Names are now converted
+  to the ASCII form before the check (or refused without the intl extension), only valid host names are accepted, and
+  every connection is forced to the checked address with `CURLOPT_CONNECT_TO` before anything is sent. Proxies from
+  the environment are no longer used.
+
 ## 1.0.2 — security fix
 
 - **Upload from URL (SSRF, parser differences).** Addresses with a user name, backslashes, spaces, control characters

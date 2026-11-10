@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.2
+ * Tiny File Manager++ 1.0.3
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.2');
+define('VERSION', '1.0.3');
 
 //Application Title
 define('APP_TITLE', 'Tiny File Manager++');
@@ -923,6 +923,9 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 if ($ch) curl_close($ch);
                 $ch = curl_init($target['url']);
                 curl_setopt($ch, CURLOPT_RESOLVE, array($target['host'] . ':' . $target['port'] . ':' . (strpos($target['ip'], ':') !== false ? '[' . $target['ip'] . ']' : $target['ip'])));
+                // connect to the checked address whatever host name curl ends up with, before anything is sent
+                curl_setopt($ch, CURLOPT_CONNECT_TO, array('::' . (strpos($target['ip'], ':') !== false ? '[' . $target['ip'] . ']' : $target['ip']) . ':' . $target['port']));
+                curl_setopt($ch, CURLOPT_PROXY, ''); // no proxy from the environment
                 curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
                 curl_setopt($ch, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
                 // an HTTP error is a failure, not a file to save
@@ -7136,7 +7139,13 @@ function fm_url_target($url)
     if (!$p || empty($p['host']) || !in_array($scheme, array('http', 'https'), true)) return 'Only http:// and https:// addresses can be downloaded.';
     if (isset($p['user']) || isset($p['pass'])) return 'Addresses with a user name or password are not allowed.';
     $host = rtrim(strtolower(trim($p['host'], '[]')), '.');
-    if ($host === '' || strpbrk($host, '%@/?#') !== false) return 'That address is not valid.';
+    // international names: check and connect with the same ASCII (punycode) form curl itself would use
+    if (preg_match('/[^\x20-\x7E]/', $host)) {
+        $ascii = function_exists('idn_to_ascii') ? @idn_to_ascii($host, IDNA_DEFAULT, INTL_IDNA_VARIANT_UTS46) : false;
+        if (!$ascii) return 'International domain names need the PHP intl extension. Use the xn-- form of the name.';
+        $host = strtolower($ascii);
+    }
+    if (!filter_var($host, FILTER_VALIDATE_IP) && !preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/', $host)) return 'That address is not valid.';
     $port = isset($p['port']) ? (int) $p['port'] : ($scheme === 'https' ? 443 : 80);
     if (in_array($port, array(22, 23, 25, 110, 143, 465, 587, 993, 995, 3306, 5432, 6379, 11211, 27017), true)) return 'That port is not allowed.';
     $ips = array();
