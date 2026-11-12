@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.8
+ * Tiny File Manager++ 1.0.9
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.8');
+define('VERSION', '1.0.9');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -22297,9 +22297,26 @@ function fm_show_header_login()
                         $('#js-update-go, #js-update-rollback, #js-update-close, #fm-update-modal .btn-close').prop('disabled', false);
                         $('#js-update-go span').text('Try again');
                     }).fail(function(xhr) {
-                        busy = false;
-                        status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> The server did not answer (' + esc(xhr.status || 'timeout') + '). Reload the page to see which version is running.');
-                        $('#js-update-close, #fm-update-modal .btn-close').prop('disabled', false);
+                        // the answer couldn't be read (e.g. a notice printed by the version that ran the update, or a
+                        // timeout): ask the server which version runs now, and judge by that
+                        var target = type === 'update_install' ? U.state.latest : U.state.backup,
+                            said = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+                        var unknown = function() {
+                            busy = false;
+                            status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + (xhr && xhr.status ? 'The answer could not be read' : 'The server did not answer in time') + (said ? ': "' + esc(said) + '"' : '') + '. Reload the page to see which version is running.');
+                            $('#js-update-close, #fm-update-modal .btn-close').prop('disabled', false);
+                        };
+                        status('busy', '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Checking which version is running now…');
+                        post('update_check', {force: ''}).done(function(d) {
+                            if (d && target && d.current === target) {
+                                status('ok', '<i class="fa fa-check-circle" aria-hidden="true"></i> ' + (type === 'update_install' ? 'Updated to version ' : 'Rolled back to version ') + esc(target) + '. Reloading…');
+                                setTimeout(function() {
+                                    location.reload();
+                                }, 1500);
+                                return;
+                            }
+                            unknown();
+                        }).fail(unknown);
                     });
                 }
 

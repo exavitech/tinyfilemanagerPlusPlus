@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.9 — update dialog confirms the result
+
+- When the answer to **Update now** or **Roll back** can't be read (for example a notice printed by the version
+  that ran the update, as 1.0.7 did on PHP 8.5, or a timeout), the dialog asks the server which version is now
+  running. If it is the new one it says "Updated to version …" and reloads; otherwise it shows what the server
+  answered, instead of "The server did not answer (200)".
+
 ## 1.0.8 — PHP 8.5, private-file check
 
 - **PHP 8.5:** `curl_close()` (a no-op since PHP 8.0, deprecated in 8.5) is no longer called. With PHP errors shown,
