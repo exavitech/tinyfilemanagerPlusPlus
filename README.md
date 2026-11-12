@@ -12,6 +12,12 @@ Drop `tinyfilemanager.php` on a PHP server, open it, create the admin account an
 - New light and dark theme, coloured icons and a compact layout that fits on one screen.
 - **Download** several files and folders as one zip, with a "Preparing download…" spinner.
 - Copy / move with a folder picker, styled dialogs, a better file view and editor page.
+- Name clashes when copying or moving: **Skip**, **Overwrite** (folders are merged) or **Keep both**, for everything or per item. The dialog checks the destination first, and the result names every item that was skipped, renamed or refused.
+
+**Maintenance**
+- **Setup check** (account menu): what the server needs for every feature (PHP extensions, upload limits, writable folders, HTTPS, `shell_exec`, server tools) and the exact command to fix each missing part, for Debian/Ubuntu, RHEL-family and Alpine. Commands are shown and copied, never run.
+- **Error log** (account menu): PHP errors, failed actions, settings problems and sign-in failures, grouped and searchable, with "Copy as bug report". A red dot on the avatar shows new errors.
+- **Updates**: the account menu shows the version and checks GitHub Releases (also once a day, can be switched off). **Update now** verifies the release's SHA-256, version and PHP syntax, keeps the old version for **Roll back**, and undoes itself if the new version doesn't start.
 
 **Settings page — no more editing PHP**
 - Every option from the top of the file, in side tabs: Appearance, Regional, Files, Uploads, Viewer & editor, Access, Network, Advanced and **Users**.
@@ -27,7 +33,7 @@ Drop `tinyfilemanager.php` on a PHP server, open it, create the admin account an
 - Guards against locking yourself out (IP rules that would block you, removing your own account, read-only for everyone).
 
 **Server tools** (optional, off by default)
-- An **Environment** page: OS, CPU, memory, disks, web server and PHP, services and Docker containers, network ports, security (updates, firewall, fail2ban, SSH), processes.
+- An **Environment** page: OS, CPU, memory, disks, web server and PHP, services and Docker containers, network ports, security (updates, firewall, fail2ban, SSH), processes. With `shell_exec` disabled it shows a "Limited view" read from `/proc`, `/sys` and the package database.
 - **Scheduled jobs**: cron jobs and systemd timers with readable schedules, next and last run; disable, enable or delete cron jobs (a backup is kept).
 - **Logs**: system journal, `/var/log`, web server, PHP, databases and Docker containers — last N lines or last N hours, errors only, search, copy and download.
 
@@ -45,9 +51,10 @@ Drop `tinyfilemanager.php` on a PHP server, open it, create the admin account an
 
 ## Requirements
 
-- PHP **7.2 or newer** (tested on 8.3) with the `session`, `json` and `fileinfo` extensions.
-- `zip` for zip archives and the zip download; `phar` for tar archives.
-- Server tools only: `shell_exec` allowed, and a Linux server. Viewing cron files, logs and switching jobs needs the PHP user to have the rights for them.
+- PHP **7.2 or newer** (tested on 8.2 and 8.3) with the `session` and `json` extensions.
+- Recommended: `zip` (zip archives and the zip download), `phar` (tar), `curl` (upload from URL, updates), `mbstring`, `fileinfo`, `posix`. **Setup check** lists what is missing and how to install it.
+- Works on hardened hosts: functions listed in `disable_functions` switch off only the feature that needs them.
+- Server tools only: a Linux server; the full view needs `shell_exec`. Viewing cron files, logs and switching jobs needs the PHP user to have the rights for them.
 
 ## Install
 
@@ -79,7 +86,8 @@ To return to the defaults, delete `settings.php` (this also removes users create
 
 - Use HTTPS, and keep the root folder as narrow as possible. `/` gives every full-access user the whole server.
 - Leave **Server tools** off unless every full-access user may see and change the system.
-- Keep **Show PHP errors** off in production; error messages can reveal paths.
+- Keep **Show PHP errors** off in production; error messages can reveal paths. Errors are still recorded in the **Error log** for administrators.
+- **Update now** trusts this repository's GitHub Releases (file + SHA-256 checksum). If you prefer to update by hand, make `tinyfilemanager.php` read-only for PHP; the app then only offers the download link.
 - Report vulnerabilities privately, see [SECURITY.md](SECURITY.md).
 
 ## Language

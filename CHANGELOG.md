@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.0.4 — copy/move conflicts, updates, setup check, error log
+
+### Copy and move
+- Copy/move no longer fails silently when names already exist in the destination. New choice under
+  Copy/Move: Skip (default), Overwrite (files replaced, folders merged) or Keep both ("name (1).ext"),
+  for all items or per item. The dialog checks the destination first and marks the clashing items;
+  the result message names every item that was skipped, renamed or refused, and why.
+- Fixed: Copy silently overwrote an older file of the same name; Move reported success for skipped items.
+- Security: copying never writes through a symbolic link in the destination (a link to a file is replaced
+  as a link; a linked folder is never merged into).
+
+### Updates
+- Account menu shows the version and "Check for updates" (administrators). A daily background check
+  (Settings > Advanced) puts a dot on the avatar when a newer release exists; the update dialog shows the
+  release notes. Update now downloads the release from GitHub Releases, checks its SHA-256, version and
+  PHP syntax, keeps the running version as a backup, replaces the file and self-tests it, rolling back
+  automatically on failure. Roll back is offered afterwards.
+
+### Setup check (new)
+- Account menu > Setup check (also a tab in Environment): what the server needs for every feature
+  (PHP extensions, upload limits, writable folders, HTTPS, shell_exec, Environment tools, sign-in) and the
+  exact command to fix each missing part, for Debian/Ubuntu, RHEL-family and Alpine. Commands are shown
+  and copied, never run. Includes a one-click test that an upload piece gets through the web server and PHP.
+
+### Error log (new)
+- Account menu > Error log (administrators): PHP warnings, uncaught exceptions and fatal errors, failed
+  actions, settings problems and sign-in failures, grouped, searchable, downloadable, with "Copy as bug
+  report". A red dot shows new errors. Stored next to settings.php in a file the web server can't serve,
+  owner-only, rotated at 1 MB; never records passwords or tokens; sign-in failures limited per address.
+
+### Environment
+- Works when PHP has shell_exec disabled: versions from the package database, disks / processes / ports /
+  interfaces / system details from /proc and /sys, SSH settings from sshd_config, updates from
+  update-notifier. A "Limited view" notice explains the rest; health badges show "—" instead of a fake 0.
+- Lists PHP-FPM pools started by their own service and reads combined php-fpm.conf files per section.
+- Fixed: IPv4 loopback written as IPv6 (::ffff:127.0.0.1) was counted as a public port.
+
+### Portability
+- Fixed: the app failed to parse at all with short_open_tag=On (PHP's default without a php.ini).
+- Fixed: hosts that disable functions such as set_time_limit, ini_set, chmod, symlink, curl_exec or
+  readfile crashed on every page under PHP 8; the app now degrades feature by feature.
+- settings.php and the error log are created owner-only even where chmod is disabled.
+
+### Interface
+- Link-styled buttons kept the link colour once visited (text invisible on primary buttons).
+
 ## 1.0.3 — security fix
 
 - **Upload from URL (international names).** curl converts an international domain name to its `xn--` form, so the

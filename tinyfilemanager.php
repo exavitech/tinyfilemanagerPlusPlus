@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.3
+ * Tiny File Manager++ 1.0.4
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,176 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.3');
+define('VERSION', '1.0.4');
+
+// Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
+// is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
+// returns when it fails, so the feature that needs it reports a failure instead. (PHP 7 keeps disabled functions
+// as warning stubs that can't be redeclared, hence the version check.) Setup check lists the disabled ones.
+if (PHP_VERSION_ID >= 80000) {
+    if (!function_exists('set_time_limit')) { function set_time_limit($s) { return false; } }
+    if (!function_exists('ini_set')) { function ini_set($k, $v) { return false; } }
+    if (!function_exists('php_uname')) { function php_uname($m = 'a') { return $m === 's' ? PHP_OS : ($m === 'm' ? '' : ($m === 'n' ? '' : PHP_OS)); } }
+    if (!function_exists('gethostname')) { function gethostname() { return trim((string) @file_get_contents('/etc/hostname')) ?: false; } }
+    if (!function_exists('get_current_user')) { function get_current_user() { return ''; } }
+    if (!function_exists('symlink')) { function symlink($t, $l) { return false; } }
+    if (!function_exists('link')) { function link($t, $l) { return false; } }
+    if (!function_exists('readlink')) { function readlink($p) { return false; } }
+    if (!function_exists('chmod')) { function chmod($f, $m) { return false; } }
+    if (!function_exists('chown')) { function chown($f, $u) { return false; } }
+    if (!function_exists('chgrp')) { function chgrp($f, $g) { return false; } }
+    if (!function_exists('touch')) { function touch($f, $m = null, $a = null) { return false; } }
+    if (!function_exists('umask')) { function umask($m = null) { return 18; } }
+    if (!function_exists('disk_free_space')) { function disk_free_space($d) { return false; } }
+    if (!function_exists('disk_total_space')) { function disk_total_space($d) { return false; } }
+    if (!function_exists('curl_exec')) { function curl_exec($h) { return false; } }
+    if (!function_exists('error_log')) { function error_log($m, $t = 0, $d = null, $h = null) { return false; } }
+    if (!function_exists('stream_socket_client')) { function stream_socket_client($r, &$en = null, &$es = null, $t = null, $f = 4, $c = null) { $en = 1; $es = 'stream_socket_client is disabled'; return false; } }
+    if (!function_exists('highlight_string')) { function highlight_string($s, $r = false) { $h = '<code>' . htmlspecialchars($s, ENT_QUOTES, 'UTF-8') . '</code>'; if ($r) return $h; echo $h; return true; } }
+    // these two must keep working, so they get real implementations
+    if (!function_exists('escapeshellarg')) { function escapeshellarg($a) { return "'" . str_replace("'", "'\\''", (string) $a) . "'"; } }
+    if (!function_exists('readfile')) { function readfile($f, $u = false, $c = null) { $h = @fopen($f, 'rb'); if (!$h) return false; $n = 0; while (!feof($h)) { $b = fread($h, 65536); if ($b === false) break; echo $b; $n += strlen($b); } fclose($h); return $n; } }
+}
+
+/** Shorten text to $len characters; works without the mbstring extension */
+function fm_cut($s, $from, $len)
+{
+    return function_exists('mb_substr') ? mb_substr($s, $from, $len, 'UTF-8') : substr($s, $from, $len * 3);
+}
+
+/* ---- Error log: tfmpp-errors.php next to settings.php ----------------------------------------------------
+ * One JSON object per line after a first line that makes PHP answer 404, so the file can't be downloaded even
+ * when it sits in the web folder. Rotated at 1 MB (one old file kept). Administrators see it in the account menu.
+ * Kinds: php (warnings, exceptions, fatal errors), action (failures users saw), config (settings and files), signin.
+ */
+function fm_errlog_file($old = false)
+{
+    $dir = dirname(isset($GLOBALS['settings_file']) ? $GLOBALS['settings_file'] : __FILE__);
+    return $dir . '/tfmpp-errors' . ($old ? '.1' : '') . '.php';
+}
+
+function fm_errlog_seen_file()
+{
+    return dirname(isset($GLOBALS['settings_file']) ? $GLOBALS['settings_file'] : __FILE__) . '/.tfmpp-errors-seen';
+}
+
+/** Which request this was: method, page parameters and the names (never the values) of what was posted */
+function fm_errlog_context()
+{
+    $q = array();
+    foreach ($_GET as $k => $v) {
+        if (!is_string($k) || preg_match('/token|pass|pwd|hash|key/i', $k)) continue;
+        $q[] = $k . (is_string($v) && $v !== '' && strlen($v) <= 200 ? '=' . $v : '');
+    }
+    $post = array();
+    foreach ($_POST as $k => $v) {
+        if (is_string($k) && $k !== 'token') $post[] = $k . (is_array($v) ? '[' . count($v) . ']' : '');
+    }
+    $t = isset($_POST['type']) && is_string($_POST['type']) && isset($_POST['ajax']) ? ' ajax:' . preg_replace('/[^\w-]/', '', $_POST['type']) : '';
+    return (isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'CLI') . ' ?' . implode('&', $q) . $t . ($post ? ' · posted: ' . implode(', ', array_slice($post, 0, 12)) : '');
+}
+
+/**
+ * Add one entry. $dedupe: skip it if the same kind + message + place was logged within that many seconds.
+ */
+function fm_errlog($kind, $msg, $where = '', $level = 'error', $dedupe = 0)
+{
+    static $n = 0, $busy = false;
+    if ($busy || ++$n > 30) return; // a broken loop must not fill the disk
+    $busy = true;
+    $f = fm_errlog_file();
+    $msg = trim(preg_replace('/\s+/', ' ', (string) $msg));
+    if ($dedupe > 0 && is_file($f)) {
+        $tail = (string) @file_get_contents($f, false, null, max(0, filesize($f) - 65536));
+        $now = time();
+        foreach (array_reverse(explode("\n", $tail)) as $l) {
+            $e = json_decode($l, true);
+            if (!is_array($e)) continue;
+            if ($now - $e['t'] > $dedupe) break;
+            $same = $kind === 'signin' ? ($e['k'] === 'signin' && $e['ip'] === (isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : '')) : ($e['k'] === $kind && $e['m'] === $msg && $e['w'] === $where);
+            if ($same) {
+                $busy = false;
+                return;
+            }
+        }
+    }
+    $user = defined('FM_SESSION_ID') && isset($_SESSION[FM_SESSION_ID]['logged']) ? (string) $_SESSION[FM_SESSION_ID]['logged'] : '';
+    $e = array('t' => time(), 'k' => $kind, 'l' => $level, 'm' => fm_cut($msg, 0, 2000), 'w' => (string) $where, 'u' => $user,
+        'ip' => isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : '', 'r' => fm_cut(fm_errlog_context(), 0, 500));
+    if (!is_link($f)) {
+        if (is_file($f) && filesize($f) > 1048576) @rename($f, fm_errlog_file(true));
+        $new = !is_file($f);
+        $line = ($new ? "<?php http_response_code(404); exit; ?>\n" : '') . json_encode($e, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE) . "\n";
+        $mask = @umask(0077);
+        if (@file_put_contents($f, $line, FILE_APPEND | LOCK_EX) !== false && $new) @chmod($f, 0600);
+        @umask($mask);
+    }
+    $busy = false;
+}
+
+/** PHP warnings and notices (not the ones silenced with @, which the code expects and handles) */
+function fm_errlog_php($no, $str, $file, $line)
+{
+    if (!(error_reporting() & $no)) return false;
+    $lv = array(E_WARNING => 'warning', E_USER_WARNING => 'warning', E_NOTICE => 'notice', E_USER_NOTICE => 'notice', E_DEPRECATED => 'notice', E_USER_DEPRECATED => 'notice', E_RECOVERABLE_ERROR => 'error', E_USER_ERROR => 'error');
+    fm_errlog('php', $str, basename($file) . ':' . $line, isset($lv[$no]) ? $lv[$no] : 'error', 300);
+    return false; // PHP's own handling (display / server log) continues as configured
+}
+
+function fm_errlog_exception($ex)
+{
+    fm_errlog('php', get_class($ex) . ': ' . $ex->getMessage(), basename($ex->getFile()) . ':' . $ex->getLine());
+    if (!headers_sent()) http_response_code(500);
+    if (ini_get('display_errors')) echo '<pre>' . htmlspecialchars((string) $ex, ENT_QUOTES, 'UTF-8') . '</pre>';
+    else echo '<p style="font:15px system-ui;margin:40px">Something went wrong. The error was logged; an administrator can see it under <b>Error log</b> in the account menu.</p>';
+}
+
+function fm_errlog_shutdown()
+{
+    $e = error_get_last();
+    if ($e && in_array($e['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR), true)) {
+        fm_errlog('php', $e['message'], basename($e['file']) . ':' . $e['line'], 'fatal');
+    }
+}
+
+/** Read the log (old file first): a list of entries, oldest first */
+function fm_errlog_read()
+{
+    $out = array();
+    foreach (array(fm_errlog_file(true), fm_errlog_file()) as $f) {
+        if (!is_file($f) || is_link($f)) continue;
+        foreach (explode("\n", (string) @file_get_contents($f)) as $l) {
+            $e = json_decode($l, true);
+            if (is_array($e) && isset($e['t'], $e['k'], $e['m'])) $out[] = $e + array('l' => 'error', 'w' => '', 'u' => '', 'ip' => '', 'r' => '');
+        }
+    }
+    return $out;
+}
+
+/** Errors since an administrator last opened the log (sign-in entries and notices such as deprecations don't count) */
+function fm_errlog_unread()
+{
+    $f = fm_errlog_file();
+    if (!is_file($f)) return 0;
+    $seen = (int) @file_get_contents(fm_errlog_seen_file());
+    if (filemtime($f) <= $seen) return 0;
+    $tail = (string) @file_get_contents($f, false, null, max(0, filesize($f) - 262144));
+    $n = 0;
+    foreach (array_reverse(explode("\n", $tail)) as $l) {
+        $e = json_decode($l, true);
+        if (!is_array($e)) continue;
+        if ($e['t'] <= $seen) break;
+        if ($e['k'] !== 'signin' && $e['l'] !== 'notice') $n++;
+        if ($n >= 99) break;
+    }
+    return $n;
+}
+
+/** Is this PHP function switched off in disable_functions? (function_exists() is true for the stand-ins above) */
+function fm_fn_disabled($name)
+{
+    return in_array(strtolower($name), array_map('trim', explode(',', strtolower((string) ini_get('disable_functions')))), true);
+}
 
 //Application Title
 define('APP_TITLE', 'Tiny File Manager++');
@@ -108,6 +277,10 @@ $logo_dark_path = 'assets/logo-dark.svg';
 // They run server commands, so they are off until a full-access user switches them on in Settings > Access
 $server_tools = false;
 
+// Updates: once a day, when an admin opens a page, ask GitHub Releases whether a newer version exists
+// (a dot on the account menu shows it). "Check for updates" in the account menu always works.
+$update_check = true;
+
 // Files and folders to excluded from listing
 // e.g. array('myfile.html', 'personal-folder', '*.php', '/path/to/folder', ...)
 $exclude_items = array();
@@ -181,6 +354,10 @@ $ext_language = array(
 // to settings.php (only the values that differ). $fm_defaults keeps these defaults for the "Default:" hints.
 // TFMPP_SETTINGS (environment) can move it, e.g. to a mounted folder outside the web root in Docker
 $settings_file = getenv('TFMPP_SETTINGS') ?: __DIR__ . '/settings.php';
+// error log (account menu > Error log): PHP warnings, uncaught exceptions and fatal errors from here on
+set_error_handler('fm_errlog_php');
+set_exception_handler('fm_errlog_exception');
+register_shutdown_function('fm_errlog_shutdown');
 $config_file = __DIR__ . '/config.php';
 $fm_defaults = fm_settings_snapshot();
 if (is_readable($config_file)) {
@@ -209,6 +386,19 @@ if (!is_array($fm_saved['users']) && is_readable($passwords_file)) {
         }
     }
     unset($changed_passwords, $pwd_user, $pwd_hash);
+}
+
+// Self-update test: right after replacing this file, the updater requests it once with a one-time code it wrote
+// next to settings.php. Answering proves the new version loads together with this server's settings.
+if (isset($_GET['fm_update_ping']) && is_string($_GET['fm_update_ping'])) {
+    $fm_nf = fm_update_nonce_file();
+    $fm_n = is_file($fm_nf) && !is_link($fm_nf) && time() - filemtime($fm_nf) < 120 ? trim((string) @file_get_contents($fm_nf)) : '';
+    if (strlen($fm_n) === 32 && hash_equals($fm_n, $_GET['fm_update_ping'])) {
+        header('Content-Type: text/plain; charset=utf-8');
+        echo 'tfmpp-ok ' . VERSION;
+        exit;
+    }
+    unset($fm_nf, $fm_n);
 }
 
 // External CDN resources that can be used in the HTML (replace for GDPR compliance)
@@ -390,7 +580,7 @@ if ($ip_ruleset != 'OFF') {
     }
 
     if ($proceed == false) {
-        trigger_error('User connection denied from: ' . $clientIp, E_USER_WARNING);
+        fm_errlog('signin', 'Connection refused by the address rules (Settings › Network)', '', 'warning', 600);
 
         if ($ip_silent == false) {
             fm_show_plain_page(403, 'Access denied', 'Connections from your network address are not allowed to use the file manager.');
@@ -436,7 +626,8 @@ if ($use_auth) {
                 fm_redirect(FM_SELF_URL);
             } else {
                 unset($_SESSION[FM_SESSION_ID]['logged']);
-                fm_set_msg('Wrong username or password.', 'error');
+                fm_errlog('signin', (isset($auth_users[$_POST['fm_usr']]) ? 'Wrong password for user "' : 'Unknown user "') . fm_cut((string) $_POST['fm_usr'], 0, 80) . '"', '', 'warning', 60);
+                fm_set_msg('Wrong username or password.', 'error', false);
                 fm_redirect(FM_SELF_URL);
             }
         } else {
@@ -510,6 +701,7 @@ $root_path = rtrim($root_path, '\\/');
 $root_path = str_replace('\\', '/', $root_path);
 if ($root_path === '') { $root_path = '/'; }
 if (!@is_dir($root_path)) {
+    fm_errlog('config', 'The folder for this account does not exist or PHP may not open it, so nothing can be shown', $root_path, 'error', 3600);
     echo "<h1>" . lng('Root path') . " \"{$root_path}\" " . lng('not found!') . " </h1>";
     exit;
 }
@@ -533,6 +725,7 @@ define('FM_CAN_CONFIGURE', $use_auth
     : !$global_readonly);
 // the Environment page and its endpoints exist only when switched on (Settings > Access > Server tools)
 define('FM_SERVER_TOOLS', FM_CAN_CONFIGURE && !empty($server_tools));
+define('FM_UPDATE_CHECK', FM_CAN_CONFIGURE && !empty($update_check));
 
 // image preview for the Settings file picker
 if (isset($_GET['fm_preview']) && FM_CAN_CONFIGURE) {
@@ -739,7 +932,49 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             echo json_encode(array('ok' => false, 'errors' => array(), 'message' => 'The request was incomplete. Reload the page and try again.'));
             exit;
         }
-        echo json_encode(fm_settings_save_request($in));
+        $r = fm_settings_save_request($in);
+        if (empty($r['ok'])) fm_errlog('action', 'Settings were not saved: ' . (isset($r['message']) && $r['message'] !== '' ? $r['message'] : 'some values were refused'), '', 'warning');
+        echo json_encode($r);
+        exit;
+    }
+
+    // Setup check: one upload piece of the configured size, to see that the web server and PHP let it through
+    if (isset($_POST['type']) && $_POST['type'] === 'setup_probe') {
+        header('Content-Type: application/json; charset=utf-8');
+        if (!FM_CAN_CONFIGURE) {
+            echo json_encode(array('ok' => false, 'error' => 'Only administrators can run this test.'));
+            exit;
+        }
+        $f = isset($_FILES['probe']) ? $_FILES['probe'] : null;
+        $msgs = array(1 => 'The piece is larger than upload_max_filesize.', 3 => 'The piece arrived only partly.', 4 => 'No file arrived.', 6 => 'PHP has no temporary folder for uploads.', 7 => 'PHP could not write the piece to its temporary folder.');
+        if (!$f || $f['error'] !== UPLOAD_ERR_OK) {
+            $code = $f ? (int) $f['error'] : 4;
+            echo json_encode(array('ok' => false, 'error' => isset($msgs[$code]) ? $msgs[$code] : 'Upload error ' . $code . '.'));
+        } else {
+            echo json_encode(array('ok' => true, 'got' => (int) $f['size']));
+        }
+        exit;
+    }
+
+    // Updates (account menu > Check for updates): admins only, from this fork's GitHub Releases
+    if (isset($_POST['type']) && in_array($_POST['type'], array('update_check', 'update_install', 'update_rollback'), true)) {
+        header('Content-Type: application/json; charset=utf-8');
+        if (!FM_CAN_CONFIGURE) {
+            echo json_encode(array('ok' => false, 'message' => 'Only administrators can update the app.'));
+            exit;
+        }
+        session_write_close(); // downloads take a while: don't block the admin's other tabs
+        if ($_POST['type'] === 'update_check') {
+            $r = fm_update_check(!empty($_POST['force']));
+            if (empty($r['ok'])) fm_errlog('config', $r['message'], 'update check', 'warning', 86400);
+        } elseif ($_POST['type'] === 'update_install') {
+            $r = fm_update_install();
+            if (empty($r['ok'])) fm_errlog('action', 'Update failed: ' . $r['message']);
+        } else {
+            $r = fm_update_rollback();
+            if (empty($r['ok'])) fm_errlog('action', 'Roll back failed: ' . $r['message']);
+        }
+        echo json_encode(fm_update_public($r));
         exit;
     }
 
@@ -769,6 +1004,28 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         }
         natcasesort($folders);
         echo json_encode(array('path' => $dir, 'folders' => array_values($folders), 'links' => $links));
+        exit();
+    }
+
+    // copy/move dialog: which of the chosen items (file[], names in the open folder) already exist in the destination
+    if (isset($_POST['type']) && $_POST['type'] == "conflicts") {
+        $dir = fm_clean_path(isset($_POST['path']) ? $_POST['path'] : '');
+        $abs = rtrim(FM_ROOT_PATH, '/') . '/' . $dir;
+        $out = array();
+        $names = isset($_POST['file']) && is_array($_POST['file']) ? $_POST['file'] : array();
+        if (is_dir($abs)) {
+            foreach (array_slice($names, 0, 5000) as $n) {
+                if (!is_string($n)) continue;
+                $n = basename(fm_clean_path($n));
+                if ($n === '' || $n === '.' || $n === '..') continue;
+                $full = rtrim($abs, '/') . '/' . $n;
+                // items hidden by the settings are never reported (the server refuses to overwrite them)
+                if ((file_exists($full) || is_link($full)) && !fm_path_hidden(trim($dir . '/' . $n, '/'))) {
+                    $out[] = array('name' => fm_convert_win($n), 'dir' => is_dir($full));
+                }
+            }
+        }
+        echo json_encode(array('path' => $dir, 'conflicts' => $out));
         exit();
     }
 
@@ -861,6 +1118,7 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         function event_callback($message)
         {
             global $callback;
+            if (isset($message['fail']['message'])) fm_errlog('action', 'Upload from URL failed: ' . $message['fail']['message'], '', 'warning');
             echo json_encode($message);
         }
 
@@ -878,8 +1136,8 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
             event_callback(array("fail" => array("message" => $target)));
             exit();
         }
-        if (!function_exists('curl_init')) {
-            event_callback(array("fail" => array("message" => 'Uploading from an address needs the PHP curl extension on this server.')));
+        if (!function_exists('curl_init') || fm_fn_disabled('curl_exec')) {
+            event_callback(array("fail" => array("message" => function_exists('curl_init') ? 'Uploading from an address needs curl_exec, which is in disable_functions on this server (see Setup check).' : 'Uploading from an address needs the PHP curl extension on this server.')));
             exit();
         }
 
@@ -1119,6 +1377,7 @@ if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
     $dest .= '/' . basename($from);
     // move?
     $move = isset($_POST['move']) || isset($_GET['move']);
+    $conflict = isset($_POST['conflict']) && in_array($_POST['conflict'], array('overwrite', 'keep'), true) ? $_POST['conflict'] : 'skip';
     // a folder can't go inside itself
     if (is_dir($from) && strpos($dest . '/', $from . '/') === 0 && $dest !== $from) {
         fm_set_msg('A folder can\'t be copied or moved into itself.', 'alert');
@@ -1126,23 +1385,7 @@ if (isset($_GET['copy'], $_GET['finish']) && !FM_READONLY) {
     }
     // copy/move/duplicate
     if ($from != $dest) {
-        $msg_from = trim(FM_PATH . '/' . basename($from), '/');
-        if ($move) { // Move and to != from so just perform move
-            $rename = fm_rename($from, $dest);
-            if ($rename) {
-                fm_set_msg(sprintf('Moved <b>/%s</b> to <b>/%s</b>.', fm_enc($copy), fm_enc($msg_from)));
-            } elseif ($rename === null) {
-                fm_set_msg(sprintf('<b>%s</b> already exists in this folder, so nothing was moved.', fm_enc(basename($from))), 'alert');
-            } else {
-                fm_set_msg(sprintf('<b>/%s</b> could not be moved. Check the permissions of both folders.', fm_enc($copy)), 'error');
-            }
-        } else { // Not move and to != from so copy with original name
-            if (fm_rcopy($from, $dest)) {
-                fm_set_msg(sprintf('Copied <b>/%s</b> to <b>/%s</b>.', fm_enc($copy), fm_enc($msg_from)));
-            } else {
-                fm_set_msg(sprintf('<b>/%s</b> could not be copied. Check the permissions of both folders.', fm_enc($copy)), 'error');
-            }
-        }
+        fm_copy_report($move, '/' . trim(FM_PATH, '/'), array(fm_place_item($from, dirname($dest), FM_PATH, $move, $conflict)));
     } else {
         if (!$move) { //Not move and to = from so duplicate
             $msg_from = trim(FM_PATH . '/' . basename($from), '/');
@@ -1207,43 +1450,21 @@ if (isset($_POST['file'], $_POST['copy_to'], $_POST['finish'], $_POST['token']) 
     }
     // move?
     $move = isset($_POST['move']);
-    // copy/move
-    $errors = 0;
-    $done = 0;
+    // a name that already exists there: skip (default), overwrite (folders merge) or keep both
+    $conflict = isset($_POST['conflict']) && in_array($_POST['conflict'], array('overwrite', 'keep'), true) ? $_POST['conflict'] : 'skip';
     $files = $_POST['file'];
+    // conflict_each[] (optional): one choice per item, in the same order as file[] (the dialog lets each clashing item have its own)
+    $each = isset($_POST['conflict_each']) && is_array($_POST['conflict_each']) ? array_values($_POST['conflict_each']) : array();
     if (is_array($files) && count($files)) {
-        foreach ($files as $f) {
-            if ($f != '') {
-                $f = fm_clean_path($f);
-                $done++;
-                // abs path from
-                $from = $path . '/' . $f;
-                // abs path to
-                $dest = $copy_to_path . '/' . $f;
-                // a folder can't be copied or moved into itself
-                if (strpos($dest . '/', $from . '/') === 0 && $dest !== $from) {
-                    $errors++;
-                    continue;
-                }
-                // do
-                if ($move) {
-                    $rename = fm_rename($from, $dest);
-                    if ($rename === false) {
-                        $errors++;
-                    }
-                } else {
-                    if (!fm_rcopy($from, $dest)) {
-                        $errors++;
-                    }
-                }
-            }
+        $results = array();
+        foreach (array_values($files) as $i => $f) {
+            if (!is_string($f) || $f == '') continue;
+            $f = basename(fm_clean_path($f));
+            if ($f === '' || $f === '.' || $f === '..') continue;
+            $mode = isset($each[$i]) && in_array($each[$i], array('skip', 'overwrite', 'keep'), true) ? $each[$i] : $conflict;
+            $results[] = fm_place_item($path . '/' . $f, $copy_to_path, $copy_to, $move, $mode);
         }
-        $where = fm_enc('/' . trim($copy_to, '/'));
-        if ($errors == 0) {
-            fm_set_msg(sprintf('%s %d %s to <b>%s</b>.', $move ? 'Moved' : 'Copied', $done, $done == 1 ? 'item' : 'items', $where));
-        } else {
-            fm_set_msg(sprintf('%d of %d items could not be %s to <b>%s</b>. An item with the same name may already be there, or a folder can\'t go inside itself.', $errors, $done, $move ? 'moved' : 'copied', $where), 'error');
-        }
+        fm_copy_report($move, '/' . trim($copy_to, '/'), $results);
     } else {
         fm_set_msg('Nothing was selected. Tick the items first.', 'alert');
     }
@@ -2224,6 +2445,8 @@ if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
     $dest_display = rtrim(fm_convert_win(rtrim(FM_ROOT_PATH, '/') . '/' . FM_PATH), '/') . '/';
     $same_folder = trim(FM_PATH, '/') === $copy_from_dir;
     $into_itself = $copy_is_dir && (trim(FM_PATH, '/') === $copy || strpos(trim(FM_PATH, '/') . '/', $copy . '/') === 0);
+    $here_abs = rtrim(rtrim(FM_ROOT_PATH, '/') . '/' . FM_PATH, '/') . '/' . basename($copy);
+    $name_taken = !$same_folder && !$into_itself && (file_exists($here_abs) || is_link($here_abs)) && !fm_path_hidden(trim(FM_PATH . '/' . basename($copy), '/'));
     $q_copy = urlencode($copy);
     // destination path chips
     $dest_crumbs = array();
@@ -2276,11 +2499,23 @@ if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
                     <div class="fm-dest-note is-problem"><i class="fa fa-exclamation-circle" aria-hidden="true"></i> A folder can't be placed inside itself. Pick a folder outside &ldquo;<?php echo fm_enc(basename($copy)) ?>&rdquo;.</div>
                 <?php elseif ($same_folder): ?>
                     <div class="fm-dest-note is-problem"><i class="fa fa-info-circle" aria-hidden="true"></i> This is the folder it's already in. Copying here makes a duplicate with a time stamp in its name.</div>
+                <?php elseif ($name_taken): ?>
+                    <div class="fm-dest-note is-problem"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <span>Goes to <strong><?php echo fm_enc($dest_display) ?></strong><br>&ldquo;<?php echo fm_enc(basename($copy)) ?>&rdquo; already exists there. Choose what to do with it:</span></div>
                 <?php else: ?>
                     <div class="fm-dest-note"><i class="fa fa-check-circle" aria-hidden="true"></i> Goes to <strong><?php echo fm_enc($dest_display) ?></strong></div>
                 <?php endif; ?>
-                <form method="post" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo $q_copy ?>&amp;finish=1" class="fm-card-actions">
+                <form method="post" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;copy=<?php echo $q_copy ?>&amp;finish=1" class="fm-card-actions<?php echo $name_taken ? ' has-conflict' : '' ?>">
                     <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                    <?php if ($name_taken): ?>
+                    <div class="fm-segmented fm-conflict-seg" role="radiogroup" aria-label="If the name already exists">
+                        <input type="radio" name="conflict" id="js-pconf-skip" value="skip" checked>
+                        <label for="js-pconf-skip"><i class="fa fa-step-forward" aria-hidden="true"></i> Skip</label>
+                        <input type="radio" name="conflict" id="js-pconf-overwrite" value="overwrite">
+                        <label for="js-pconf-overwrite"><i class="fa fa-refresh" aria-hidden="true"></i> Overwrite</label>
+                        <input type="radio" name="conflict" id="js-pconf-keep" value="keep">
+                        <label for="js-pconf-keep"><i class="fa fa-clone" aria-hidden="true"></i> Keep both</label>
+                    </div>
+                    <?php endif; ?>
                     <a class="btn btn-outline-secondary" href="?p=<?php echo urlencode($copy_from_dir) ?>"><?php echo lng('Cancel') ?></a>
                     <button type="submit" name="move" value="1" class="btn btn-outline-secondary"<?php echo ($same_folder || $into_itself) ? ' disabled' : '' ?>><i class="fa fa-arrow-right" aria-hidden="true"></i> Move here</button>
                     <button type="submit" class="btn btn-primary"<?php echo $into_itself ? ' disabled' : '' ?>><i class="fa fa-files-o" aria-hidden="true"></i> <?php echo $same_folder ? 'Duplicate here' : 'Copy here' ?></button>
@@ -3233,6 +3468,233 @@ if (isset($_GET['settings']) && FM_CAN_CONFIGURE) {
     exit;
 }
 
+// Error log (account menu): what went wrong, grouped, with download, clear and "copy as bug report" (admins)
+if (isset($_GET['errors']) && FM_CAN_CONFIGURE) {
+    if (isset($_POST['errors_clear'])) {
+        if (!isset($_POST['token']) || !verifyToken($_POST['token'])) {
+            fm_set_msg(lng('This page had expired, so nothing was changed. Please try again.'), 'alert');
+        } else {
+            @unlink(fm_errlog_file());
+            @unlink(fm_errlog_file(true));
+            @file_put_contents(fm_errlog_seen_file(), (string) time());
+            fm_set_msg('The error log was cleared.');
+        }
+        fm_redirect(FM_SELF_URL . '?p=' . urlencode(FM_PATH) . '&errors=1');
+    }
+    $entries = fm_errlog_read();
+    if (isset($_GET['download'])) {
+        header('Content-Type: text/plain; charset=utf-8');
+        header('Content-Disposition: attachment; filename="tfmpp-errors-' . date('Ymd-His') . '.txt"');
+        echo 'Tiny File Manager++ ' . VERSION . ' · PHP ' . PHP_VERSION . ' (' . php_sapi_name() . ') · ' . (isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : '') . "\n\n";
+        foreach (array_reverse($entries) as $e) echo date('Y-m-d H:i:s', $e['t']) . ' [' . $e['k'] . ' ' . $e['l'] . '] ' . $e['m'] . ($e['w'] !== '' ? ' @ ' . $e['w'] : '') . ' | ' . ($e['u'] !== '' ? $e['u'] : '-') . ' ' . $e['ip'] . ' | ' . $e['r'] . "\n";
+        exit;
+    }
+    $seen = (int) @file_get_contents(fm_errlog_seen_file());
+    @file_put_contents(fm_errlog_seen_file(), (string) time()); // opening the log marks everything read
+    // group repeats: same kind, message and place
+    $groups = array();
+    foreach ($entries as $e) {
+        $g = md5($e['k'] . '|' . $e['m'] . '|' . $e['w']);
+        if (!isset($groups[$g])) $groups[$g] = array('k' => $e['k'], 'l' => $e['l'], 'm' => $e['m'], 'w' => $e['w'], 'n' => 0, 'first' => $e['t'], 'last' => $e['t'], 'users' => array(), 'ips' => array(), 'r' => $e['r']);
+        $x = &$groups[$g];
+        $x['n']++;
+        $x['last'] = max($x['last'], $e['t']);
+        $x['first'] = min($x['first'], $e['t']);
+        if ($e['u'] !== '') $x['users'][$e['u']] = 1;
+        if ($e['ip'] !== '') $x['ips'][$e['ip']] = 1;
+        if ($e['t'] >= $x['last']) $x['r'] = $e['r'];
+        if ($e['l'] === 'fatal' || ($e['l'] === 'error' && $x['l'] !== 'fatal')) $x['l'] = $e['l'];
+        unset($x);
+    }
+    usort($groups, function ($a, $b) {
+        return $b['last'] <=> $a['last'];
+    });
+    $groups = array_slice($groups, 0, 400);
+    $kinds = array('php' => array('PHP errors', 'fa-code'), 'action' => array('Failed actions', 'fa-hand-pointer-o'), 'config' => array('Settings & files', 'fa-sliders'), 'signin' => array('Sign-in', 'fa-sign-in'));
+    $count = array('all' => count($groups));
+    foreach ($kinds as $k => $x) $count[$k] = 0;
+    foreach ($groups as $g) if (isset($count[$g['k']])) $count[$g['k']]++;
+    $sp = fm_setup_platform();
+    $env_line = 'Tiny File Manager++ ' . VERSION . ' · PHP ' . PHP_VERSION . ' (' . $sp['sapi'] . ') · ' . $sp['os'] . ' · ' . ($sp['web'] ?: 'unknown web server');
+    fm_show_header(); // HEADER
+    fm_show_nav_path(FM_PATH); // current path
+?>
+    <div class="fm-page fm-errlog-page">
+        <div class="fm-page-head">
+            <div>
+                <h1>Error log</h1>
+            </div>
+            <div class="fm-env-head-actions">
+                <a class="btn btn-outline-secondary btn-sm<?php echo $entries ? '' : ' disabled' ?>" href="?p=<?php echo urlencode(FM_PATH) ?>&amp;errors=1&amp;download=1"><i class="fa fa-download" aria-hidden="true"></i> Download</a>
+                <form method="post" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;errors=1" class="fm-errlog-clear">
+                    <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                    <input type="hidden" name="errors_clear" value="1">
+                    <button type="button" class="btn btn-outline-secondary btn-sm" id="fm-errlog-clear"<?php echo $entries ? '' : ' disabled' ?>><i class="fa fa-trash-o" aria-hidden="true"></i> <span>Clear</span></button>
+                </form>
+            </div>
+        </div>
+        <div class="card fm-errlog" data-bs-theme="<?php echo FM_THEME; ?>">
+            <div class="fm-errlog-bar">
+                <div class="fm-segmented" role="radiogroup" aria-label="Kind">
+                    <input type="radio" name="fm-errlog-kind" id="fm-ek-all" value="all" checked><label for="fm-ek-all">All <em><?php echo $count['all'] ?></em></label>
+                    <?php foreach ($kinds as $k => $x): ?><input type="radio" name="fm-errlog-kind" id="fm-ek-<?php echo $k ?>" value="<?php echo $k ?>"><label for="fm-ek-<?php echo $k ?>"><i class="fa <?php echo $x[1] ?>" aria-hidden="true"></i> <?php echo $x[0] ?> <em><?php echo $count[$k] ?></em></label><?php endforeach; ?>
+                </div>
+                <div class="fm-input-icon fm-errlog-search"><i class="fa fa-search" aria-hidden="true"></i><input type="search" class="form-control" id="fm-errlog-q" placeholder="Search messages, files, users…" aria-label="Search the log"></div>
+            </div>
+            <div class="fm-errlog-list" id="fm-errlog-list">
+                <?php if (!$groups): ?>
+                    <p class="fm-errlog-empty"><i class="fa fa-check-circle" aria-hidden="true"></i> Nothing has gone wrong. Errors, failed actions, settings problems and sign-in failures will show up here.</p>
+                <?php endif; ?>
+                <?php foreach ($groups as $g): $new = $g['last'] > $seen; $lv = $g['k'] === 'signin' ? 'note' : ($g['l'] === 'fatal' || $g['l'] === 'error' ? 'bad' : 'warn'); ?>
+                    <details class="fm-errlog-item is-<?php echo $lv ?><?php echo $new ? ' is-new' : '' ?>" data-kind="<?php echo $g['k'] ?>">
+                        <summary>
+                            <i class="fa <?php echo $kinds[$g['k']][1] ?? 'fa-circle' ?> fm-errlog-kind" title="<?php echo fm_enc($kinds[$g['k']][0] ?? $g['k']) ?>" aria-hidden="true"></i>
+                            <span class="fm-errlog-msg"><?php echo fm_enc($g['m']) ?></span>
+                            <?php if ($new): ?><span class="fm-env-badge is-bad">new</span><?php endif; ?>
+                            <?php if ($g['n'] > 1): ?><span class="fm-env-badge" title="<?php echo $g['n'] ?> times">×<?php echo $g['n'] ?></span><?php endif; ?>
+                            <span class="fm-errlog-when" title="<?php echo date('Y-m-d H:i:s', $g['last']) ?>"><?php echo fm_env_ago($g['last']) ?></span>
+                        </summary>
+                        <dl class="fm-env-kv">
+                            <dt>Kind</dt><dd><?php echo fm_enc(($kinds[$g['k']][0] ?? $g['k']) . ' · ' . $g['l']) ?></dd>
+                            <?php if ($g['w'] !== ''): ?><dt>Where</dt><dd><code><?php echo fm_enc($g['w']) ?></code></dd><?php endif; ?>
+                            <dt>When</dt><dd><?php echo date('Y-m-d H:i:s', $g['last']) ?><?php echo $g['n'] > 1 ? ' <span class="fm-env-muted">(' . $g['n'] . ' times since ' . date('Y-m-d H:i', $g['first']) . ')</span>' : '' ?></dd>
+                            <dt>Who</dt><dd><?php echo fm_enc(implode(', ', array_keys($g['users'])) ?: 'not signed in') ?> <span class="fm-env-muted"><?php echo fm_enc(implode(', ', array_slice(array_keys($g['ips']), 0, 5))) ?></span></dd>
+                            <dt>Request</dt><dd><code><?php echo fm_enc($g['r']) ?></code></dd>
+                        </dl>
+                        <p class="fm-errlog-actions"><button type="button" class="btn btn-outline-secondary btn-sm fm-errlog-report"><i class="fa fa-github" aria-hidden="true"></i> Copy as bug report</button> <span class="fm-env-muted">Check it for private paths or names before posting it publicly.</span></p>
+                        <textarea hidden class="fm-errlog-text"><?php echo fm_enc("**Error:** " . $g['m'] . "\n**Kind:** " . $g['k'] . ' / ' . $g['l'] . ($g['w'] !== '' ? "\n**Where:** " . $g['w'] : '') . "\n**Seen:** " . $g['n'] . ' time(s), last ' . date('Y-m-d H:i', $g['last']) . "\n**Request:** " . $g['r'] . "\n**Environment:** " . $env_line . "\n\n**What I was doing:** ") ?></textarea>
+                    </details>
+                <?php endforeach; ?>
+                <p class="fm-errlog-empty" id="fm-errlog-none" hidden>No entries match.</p>
+            </div>
+        </div>
+    </div>
+    <script>
+    (function() {
+        var list = document.getElementById('fm-errlog-list'), q = document.getElementById('fm-errlog-q');
+        function apply() {
+            var kind = (document.querySelector('input[name="fm-errlog-kind"]:checked') || {}).value || 'all', t = q.value.trim().toLowerCase(), shown = 0;
+            list.querySelectorAll('.fm-errlog-item').forEach(function(it) {
+                var ok = (kind === 'all' || it.getAttribute('data-kind') === kind) && (!t || it.textContent.toLowerCase().indexOf(t) !== -1);
+                it.hidden = !ok;
+                if (ok) shown++;
+            });
+            var none = document.getElementById('fm-errlog-none');
+            if (none) none.hidden = shown > 0 || !list.querySelector('.fm-errlog-item');
+        }
+        document.addEventListener('change', function(e) { if (e.target.name === 'fm-errlog-kind') apply(); });
+        q.addEventListener('input', apply);
+        list.addEventListener('click', function(e) {
+            var b = e.target.closest('.fm-errlog-report');
+            if (!b) return;
+            var text = b.closest('.fm-errlog-item').querySelector('.fm-errlog-text').value;
+            var done = function() { if (typeof toast === 'function') toast('Bug report copied'); };
+            if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).then(done);
+            else { var t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand('copy'); done(); } catch (x) {} t.remove(); }
+        });
+        // Clear: two clicks, no browser dialog
+        var clear = document.getElementById('fm-errlog-clear'), armed = false;
+        if (clear) clear.addEventListener('click', function() {
+            if (!armed) { armed = true; clear.classList.add('is-armed'); clear.querySelector('span').textContent = 'Click again to clear'; return; }
+            clear.form.submit();
+        });
+    })();
+    </script>
+<?php
+    fm_show_footer();
+    exit;
+}
+
+// Setup check: what this server needs, what is missing and how to fix it (admins; works with Server tools off)
+if (isset($_GET['setup']) && FM_CAN_CONFIGURE) {
+    $setup = fm_setup_checks();
+    $sn = fm_setup_counts($setup);
+    $sp = fm_setup_platform();
+    fm_show_header(); // HEADER
+    fm_show_nav_path(FM_PATH); // current path
+    $fam = array('debian' => 'Debian / Ubuntu (apt)', 'rhel' => 'RHEL / Rocky / Alma / Fedora (dnf)', 'alpine' => 'Alpine (apk)', 'other' => 'other (no commands)');
+?>
+    <div class="fm-page fm-setup-page">
+        <div class="fm-page-head">
+            <div>
+                <h1>Setup check</h1>
+            </div>
+            <div class="fm-env-head-actions">
+                <label class="fm-env-toggle"><input type="checkbox" data-setup-passing> Show passing checks</label>
+                <button type="button" class="btn btn-outline-secondary btn-sm" data-setup-copyall><i class="fa fa-clipboard" aria-hidden="true"></i> Copy all fixes</button>
+                <button type="button" class="btn btn-primary btn-sm" onclick="location.reload()"><i class="fa fa-refresh" aria-hidden="true"></i> Check again</button>
+            </div>
+        </div>
+        <div class="fm-setup-layout">
+            <?php
+                $total = max(1, array_sum($sn));
+                $verdict = $sn['fail'] ? ($sn['fail'] === 1 ? '1 thing needs fixing' : $sn['fail'] . ' things need fixing') : ($sn['warn'] ? 'Works, with ' . $sn['warn'] . ' limitation' . ($sn['warn'] > 1 ? 's' : '') : 'Everything is in place');
+                $tone = $sn['fail'] ? 'is-fail' : ($sn['warn'] ? 'is-warn' : 'is-ok');
+                // the ring: one arc per status, in the order fail, warn, info, ok
+                $r = 42;
+                $circ = 2 * M_PI * $r;
+                $arcs = '';
+                $off = 0;
+                foreach (array('fail', 'warn', 'info', 'ok') as $st) {
+                    if (!$sn[$st]) continue;
+                    $len = $sn[$st] / $total * $circ;
+                    $arcs .= '<circle class="is-' . $st . '" cx="50" cy="50" r="' . $r . '" stroke-dasharray="' . round(max(0, $len - 1.5), 2) . ' ' . round($circ, 2) . '" stroke-dashoffset="' . round(-$off, 2) . '"/>';
+                    $off += $len;
+                }
+                $path = function ($v) {
+                    return str_replace('/', '/<wbr>', fm_enc($v));
+                };
+                $facts = array(
+                    array('fa-linux', 'System', fm_enc($sp['os']), fm_enc($fam[$sp['family']])),
+                    array('fa-code', 'PHP', fm_enc(PHP_VERSION), fm_enc(($sp['sapi'] === 'fpm-fcgi' ? 'PHP-FPM' : ($sp['sapi'] === 'apache2handler' ? 'Apache module' : $sp['sapi'])) . ' · runs as ' . $sp['user'])),
+                );
+                if ($sp['pool'] !== '') $facts[] = array('fa-cubes', 'Pool', fm_enc($sp['pool']) . ($sp['service'] !== '' ? ' <span>· ' . fm_enc($sp['service']) . '</span>' : ''), $sp['pool_file'] !== '' ? '<code>' . $path($sp['pool_file']) . '</code>' : '');
+                elseif ($sp['service'] !== '') $facts[] = array('fa-cog', 'Service', fm_enc($sp['service']), '');
+                $facts[] = array('fa-file-text-o', 'php.ini', '<code>' . $path($sp['ini'] ?: 'none') . '</code>', '');
+                $facts[] = array('fa-globe', 'Web', fm_enc($sp['web'] ?: 'unknown'), '');
+            ?>
+            <aside class="card fm-setup-side" data-bs-theme="<?php echo FM_THEME; ?>">
+                <div class="fm-setup-head-card">
+                    <div class="fm-setup-score">
+                        <svg viewBox="0 0 100 100" class="fm-setup-ring" role="img" aria-label="<?php echo $sn['ok'] ?> of <?php echo array_sum($sn) ?> checks pass">
+                            <circle class="is-track" cx="50" cy="50" r="<?php echo $r ?>"/>
+                            <g transform="rotate(-90 50 50)"><?php echo $arcs ?></g>
+                        </svg>
+                        <div class="fm-setup-ring-label"><strong><?php echo $sn['ok'] ?></strong><span>of <?php echo array_sum($sn) ?></span></div>
+                    </div>
+                    <div>
+                        <p class="fm-setup-verdict <?php echo $tone ?>"><?php echo $verdict ?></p>
+                        <p class="fm-setup-checked"><?php echo $sn['ok'] ?> of <?php echo array_sum($sn) ?> checks pass<br>Checked at <?php echo date('H:i') ?></p>
+                    </div>
+                </div>
+
+                <div class="fm-setup-filters" role="group" aria-label="Show">
+                    <?php foreach (array('fail' => array('To fix', 'fa-times-circle'), 'warn' => array('Limited', 'fa-exclamation-triangle'), 'info' => array('Notes', 'fa-info-circle'), 'ok' => array('Passing', 'fa-check-circle')) as $st => $x): ?>
+                        <button type="button" class="fm-setup-filter is-<?php echo $st ?>" data-setup-filter="<?php echo $st ?>"<?php echo $sn[$st] ? '' : ' disabled' ?> aria-pressed="false">
+                            <i class="fa <?php echo $x[1] ?>" aria-hidden="true"></i><span><?php echo $x[0] ?></span><em><?php echo $sn[$st] ?></em>
+                        </button>
+                    <?php endforeach; ?>
+                </div>
+
+                <h2 class="fm-setup-side-h">This server</h2>
+                <ul class="fm-setup-facts">
+                    <?php foreach ($facts as $f): ?>
+                        <li><i class="fa <?php echo $f[0] ?>" aria-hidden="true"></i><span class="fm-setup-fact-k"><?php echo $f[1] ?></span><div><strong><?php echo $f[2] ?></strong><?php if ($f[3] !== ''): ?><small><?php echo $f[3] ?></small><?php endif; ?></div></li>
+                    <?php endforeach; ?>
+                </ul>
+            </aside>
+            <div class="card fm-setup-main" data-bs-theme="<?php echo FM_THEME; ?>">
+                <p class="fm-setup-intro"><i class="fa fa-shield" aria-hidden="true"></i> Nothing here runs by itself: open an item, copy its command and run it over SSH, then click <strong>Check again</strong>.</p>
+                <?php echo fm_setup_render($setup) ?>
+            </div>
+        </div>
+    </div>
+<?php
+    echo fm_setup_script();
+    fm_show_footer();
+    exit;
+}
+
 if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
     @set_time_limit(60);
     $env_sys = fm_env_system();
@@ -3267,6 +3729,12 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
     if ($c_down) $env_alerts[] = array('warn', count($c_down) . ' container' . (count($c_down) > 1 ? 's are' : ' is') . ' not running: ' . implode(', ', array_slice($c_down, 0, 4)), 'services');
     if ($env_sys['ntp'] === 'no') $env_alerts[] = array('warn', 'The clock is not synchronised (NTP)', 'system');
     if (is_file('/var/run/reboot-required')) $env_alerts[] = array('warn', 'A reboot is needed to finish updates', 'security');
+    $env_noshell = !fm_env_shell_ok();
+    if ($env_noshell) $env_alerts[] = array('warn', 'Limited view: PHP has shell_exec disabled', 'setup');
+    $env_setup = fm_setup_checks();
+    $env_sn = fm_setup_counts($env_setup);
+    $env_todo = $env_sn['fail'] + $env_sn['warn'] - ($env_noshell ? 1 : 0);
+    if ($env_todo > 0) $env_alerts[] = array($env_sn['fail'] ? 'bad' : 'warn', 'Setup check: ' . $env_todo . ' item' . ($env_todo > 1 ? 's need' : ' needs') . ' attention', 'setup');
     $c_running = count($env_svc['containers']) - count($c_down);
     $public_ports = count(array_filter($env_net['ports'], function ($p) { return $p['public']; }));
     $real_disks = array_values(array_filter($env_disks, function ($d) { return $d['size'] > 64 * 1048576; }));
@@ -3280,7 +3748,7 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
     foreach ($real_disks as $d) $report .= "Disk " . $d['mount'] . ": " . fm_env_bytes($d['used']) . " of " . fm_env_bytes($d['size']) . " (" . $d['pct'] . "%)\n";
     $report .= "Web: nginx " . $env_web['nginx'] . " · PHP " . $env_web['php'] . " (" . $env_web['sapi'] . ")";
     foreach ($env_web['runtimes'] as $k => $v) $report .= " · " . $k . " " . $v;
-    $report .= "\nServices: " . count($env_svc['failed']) . " failed · containers " . $c_running . "/" . count($env_svc['containers']) . " running\n";
+    $report .= $env_noshell ? "\nServices: unknown (shell_exec is disabled)\n" : "\nServices: " . count($env_svc['failed']) . " failed · containers " . $c_running . "/" . count($env_svc['containers']) . " running\n";
     foreach ($env_alerts as $a) $report .= "! " . $a[1] . "\n";
 
     fm_show_header(); // HEADER
@@ -3288,7 +3756,7 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
     $env_tabs = array('overview' => array('Overview', 'fa-tachometer'), 'system' => array('System', 'fa-server'), 'memory' => array('Memory', 'fa-microchip'),
         'storage' => array('Storage', 'fa-hdd-o'), 'web' => array('Web & PHP', 'fa-globe'), 'services' => array('Services', 'fa-cubes'),
         'network' => array('Network', 'fa-sitemap'), 'security' => array('Security', 'fa-shield'), 'processes' => array('Processes', 'fa-tasks'),
-        'jobs' => array('Scheduled jobs', 'fa-clock-o'), 'logs' => array('Logs', 'fa-file-text-o'));
+        'jobs' => array('Scheduled jobs', 'fa-clock-o'), 'logs' => array('Logs', 'fa-file-text-o'), 'setup' => array('Setup check', 'fa-stethoscope'));
     $kv = function ($pairs) use ($e) {
         $h = '<dl class="fm-env-kv">';
         foreach ($pairs as $k => $v) $h .= '<dt>' . $e($k) . '</dt><dd>' . $v . '</dd>';
@@ -3364,8 +3832,8 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
                         <div class="fm-env-card">
                             <h3><i class="fa fa-heartbeat" aria-hidden="true"></i> Health</h3>
                             <ul class="fm-env-health">
-                                <li><span>Failed services</span><?php echo $env_svc['failed'] ? fm_env_badge(count($env_svc['failed']), 'is-bad') : fm_env_badge('0', 'is-ok') ?></li>
-                                <li><span>Containers running</span><?php echo fm_env_badge($c_running . ' / ' . count($env_svc['containers']), $c_down || $c_bad ? 'is-warn' : 'is-ok') ?></li>
+                                <li><span>Failed services</span><?php echo $env_noshell ? '<span class="fm-env-badge" title="Needs shell_exec (disabled for this PHP pool)">—</span>' : ($env_svc['failed'] ? fm_env_badge(count($env_svc['failed']), 'is-bad') : fm_env_badge('0', 'is-ok')) ?></li>
+                                <li><span>Containers running</span><?php echo $env_noshell ? '<span class="fm-env-badge" title="Needs shell_exec (disabled for this PHP pool)">—</span>' : fm_env_badge($c_running . ' / ' . count($env_svc['containers']), $c_down || $c_bad ? 'is-warn' : 'is-ok') ?></li>
                                 <li><span>Public ports</span><?php echo fm_env_badge($public_ports) ?></li>
                                 <li><span>Banned by fail2ban</span><span id="fm-env-banned"><i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i></span></li>
                                 <li><span>Updates</span><span id="fm-env-updates"><i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i></span></li>
@@ -3393,7 +3861,7 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
                         <section class="fm-env-box"><h3>CPU & time</h3><?php echo $kv(array('Processor' => $e($env_sys['cpu']), 'Threads' => $env_sys['threads'],
                             'Load 1 / 5 / 15 min' => implode(' / ', $env_sys['load']), 'Running / total tasks' => $e($env_sys['tasks']),
                             'Up since' => date('Y-m-d H:i', $env_sys['boot']) . ' <span class="fm-env-muted">(' . fm_env_duration($env_sys['uptime']) . ')</span>',
-                            'Timezone' => $e($env_sys['tz']), 'Clock synchronised' => $env_sys['ntp'] === 'yes' ? fm_env_badge('Yes', 'is-ok') : fm_env_badge($env_sys['ntp'] ?: 'unknown', 'is-warn'),
+                            'Timezone' => $e($env_sys['tz']), 'Clock synchronised' => $env_sys['ntp'] === 'yes' ? fm_env_badge('Yes', 'is-ok') : ($env_sys['ntp'] ? fm_env_badge($env_sys['ntp'], 'is-warn') : fm_env_badge('unknown')),
                             'Server time' => date('Y-m-d H:i:s'))) ?></section>
                     </div>
                 </section>
@@ -3454,6 +3922,7 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
                                 'OPcache hit rate' => round($env_web['opcache']['opcache_statistics']['opcache_hit_rate'], 1) . '% <span class="fm-env-muted">(' . number_format($env_web['opcache']['opcache_statistics']['num_cached_scripts']) . ' scripts)</span>') : array('OPcache' => 'off'))) ?></section>
                         <section class="fm-env-box">
                             <h3>Software</h3>
+                            <?php if ($env_noshell): ?><p class="fm-env-muted fm-env-note" id="fm-env-noshell"><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> <code>shell_exec</code> is in this PHP pool's <code>disable_functions</code>: versions come from the package list, disks, processes and ports from /proc, and services, containers, the firewall and timers can't be read. <a href="#setup" data-goto="setup">How to change that</a></p><?php endif; ?>
                             <?php echo $kv(array('nginx' => $e($env_web['nginx'] ?: 'not found')) + array_map($e, $env_web['runtimes'])) ?>
                             <h3 class="fm-env-sub">PHP-FPM pools</h3>
                             <div class="fm-env-tablewrap"><table class="fm-env-table"><thead><tr><th>Pool</th><th>PHP</th><th>User</th><th>Listens on</th><th>Workers</th></tr></thead><tbody>
@@ -3476,16 +3945,17 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
                         <section class="fm-env-box">
                             <h3>Services <span class="fm-env-muted"><?php echo count($env_svc['all']) ?></span> <label class="fm-env-toggle"><input type="checkbox" id="fm-env-allsvc"> Show all</label></h3>
                             <div class="fm-env-tablewrap is-tall"><table class="fm-env-table" id="fm-env-svc"><thead><tr><th>Service</th><th>State</th><th>Description</th></tr></thead><tbody>
+                                <?php if ($env_noshell && !$env_svc['all']): ?><tr><td colspan="3" class="fm-env-muted">Needs shell_exec (disabled for this PHP pool).</td></tr><?php endif; ?>
                                 <?php foreach ($env_svc['all'] as $s): $st = $s['active'] === 'failed' ? 'is-bad' : ($s['active'] === 'active' ? 'is-ok' : ''); ?>
                                     <tr class="<?php echo $s['key'] || $s['active'] === 'failed' ? '' : 'is-minor' ?>"><td class="is-mono"><?php echo $e($s['unit']) ?></td><td><?php echo fm_env_badge($s['active'] === 'active' ? $s['sub'] : $s['active'], $st) ?></td><td class="fm-env-muted"><?php echo $e($s['desc']) ?></td></tr>
                                 <?php endforeach; ?>
                             </tbody></table></div>
                         </section>
                         <section class="fm-env-box">
-                            <h3>Docker containers <span class="fm-env-muted"><?php echo $c_running ?> / <?php echo count($env_svc['containers']) ?> running</span></h3>
+                            <h3>Docker containers <?php if (!$env_noshell): ?><span class="fm-env-muted"><?php echo $c_running ?> / <?php echo count($env_svc['containers']) ?> running</span><?php endif; ?></h3>
                             <div class="fm-env-tablewrap is-tall"><table class="fm-env-table"><thead><tr><th>Container</th><th>State</th><th>Status</th></tr></thead><tbody>
                                 <?php foreach ($env_svc['containers'] as $c): ?><tr><td><strong><?php echo $e(preg_replace('/^mailcowdockerized-|-mailcow-\d+$/', '', $c['name'])) ?></strong><br><span class="fm-env-muted is-mono"><?php echo $e($c['image']) ?></span></td><td><?php echo fm_env_badge($c['unhealthy'] ? 'unhealthy' : $c['state'], $c['unhealthy'] ? 'is-bad' : ($c['state'] === 'running' ? 'is-ok' : 'is-warn')) ?></td><td class="fm-env-muted"><?php echo $e($c['status']) ?></td></tr><?php endforeach; ?>
-                                <?php if (!$env_svc['containers']): ?><tr><td colspan="3" class="fm-env-muted">Docker is not installed or has no containers.</td></tr><?php endif; ?>
+                                <?php if (!$env_svc['containers']): ?><tr><td colspan="3" class="fm-env-muted"><?php echo $env_noshell ? 'Needs shell_exec (disabled for this PHP pool).' : 'Docker is not installed or has no containers.' ?></td></tr><?php endif; ?>
                             </tbody></table></div>
                         </section>
                     </div>
@@ -3536,6 +4006,13 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
                     <header class="fm-set-panel-head"><h2><i class="fa fa-clock-o" aria-hidden="true"></i>Scheduled jobs</h2><p>Cron jobs and systemd timers: what runs when, and when it last ran.</p></header>
                     <div class="fm-env-async"><p class="fm-env-loading"><i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Reading cron files and the system log…</p></div>
                     <p class="fm-env-flash" id="fm-env-jobmsg" role="status" hidden></p>
+                </section>
+
+                <!-- Setup check -->
+                <section class="fm-set-panel" id="fm-env-p-setup" data-tab="setup" hidden>
+                    <header class="fm-set-panel-head fm-setup-head"><h2><i class="fa fa-stethoscope" aria-hidden="true"></i>Setup check</h2><p><?php echo $env_sn['fail'] ?> to fix · <?php echo $env_sn['warn'] ?> limited · <?php echo $env_sn['info'] ?> notes · <?php echo $env_sn['ok'] ?> OK</p>
+                        <div class="fm-setup-tools"><label class="fm-env-toggle"><input type="checkbox" data-setup-passing> Show passing</label><button type="button" class="btn btn-outline-secondary btn-sm" data-setup-copyall><i class="fa fa-clipboard" aria-hidden="true"></i> Copy all fixes</button><a class="btn btn-outline-secondary btn-sm" href="?p=&amp;setup=1">Full page</a></div></header>
+                    <?php echo fm_setup_render($env_setup, true) ?>
                 </section>
 
                 <!-- Logs -->
@@ -3714,8 +4191,8 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
             loadAsync($('fm-env-p-security')).then(function(r) {
                 if (r) {
                     addAlerts(r.alerts);
-                    $('fm-env-banned').innerHTML = '<span class="fm-env-badge' + (r.banned ? ' is-warn' : ' is-ok') + '">' + r.banned + '</span>';
-                    $('fm-env-updates').innerHTML = r.updates ? '<span class="fm-env-badge ' + (r.updates.security ? 'is-bad' : (r.updates.all ? 'is-warn' : 'is-ok')) + '">' + (r.updates.all ? r.updates.all + ' (' + r.updates.security + ' security)' : 'Up to date') + '</span>' : '—';
+                    $('fm-env-banned').innerHTML = r.noshell ? '<span class="fm-env-badge" title="Needs shell_exec (disabled for this PHP pool)">—</span>' : '<span class="fm-env-badge' + (r.banned ? ' is-warn' : ' is-ok') + '">' + r.banned + '</span>';
+                    $('fm-env-updates').innerHTML = r.updates ? '<span class="fm-env-badge ' + (r.updates.security ? 'is-bad' : (r.updates.all ? 'is-warn' : 'is-ok')) + '">' + (r.updates.all ? r.updates.all + ' (' + r.updates.security + ' security)' : 'Up to date') + '</span>' : (r.noshell ? '<span class="fm-env-badge" title="Needs shell_exec (disabled for this PHP pool)">—</span>' : '—');
                 } else { $('fm-env-banned').textContent = '—'; $('fm-env-updates').textContent = '—'; }
                 partDone();
             });
@@ -3824,6 +4301,7 @@ if (isset($_GET['environment']) && FM_SERVER_TOOLS) {
         })();
     </script>
 <?php
+    echo fm_setup_script();
     fm_show_footer();
     exit;
 }
@@ -4158,6 +4636,20 @@ if (isset($_GET['help'])) {
                 <p>Use the pencil icon to rename. Open a text file to view it, then <strong>Edit</strong> to change it. Click the permission number (like <code>0644</code>) to change who can read or write it.</p>
             </article>
         </div>
+
+        <?php if (FM_CAN_CONFIGURE) { ?>
+            <section class="card fm-tool-card fm-help-setup" data-bs-theme="<?php echo FM_THEME; ?>">
+                <div class="fm-tool-head">
+                    <span class="fm-help-icon is-setup"><i class="fa fa-stethoscope" aria-hidden="true"></i></span>
+                    <div>
+                        <h2>Server setup and the Environment page</h2>
+                        <p><a href="?p=&amp;setup=1">Setup check</a> (account menu) lists what this server needs for every feature (PHP extensions, upload limits, writable folders, HTTPS) and gives the command that fixes each missing part. It runs nothing by itself.
+                        If PHP has <code>shell_exec</code> in <code>disable_functions</code>, the Environment page shows a <strong>Limited view</strong>: versions, disks, processes and ports still come from files, but services, the firewall and timers can't be read. That is safe and fine.
+                        For the full view, remove <code>shell_exec</code> for this app's PHP pool only (Setup check shows the exact line and restart). The page only runs fixed, read-only commands, but allowing <code>shell_exec</code> widens what a PHP bug in that pool could do; on an unprivileged pool, keeping it off is a fair choice.</p>
+                    </div>
+                </div>
+            </section>
+        <?php } ?>
 
         <?php if (!FM_READONLY) { ?>
             <section class="card fm-tool-card" data-bs-theme="<?php echo FM_THEME; ?>">
@@ -5426,7 +5918,8 @@ function fm_rcopy($path, $dest, $upd = true, $force = true)
     }
 
     if (is_dir($path)) {
-        if (!fm_mkdir($dest, $force)) {
+        // merging into an existing folder: never follow a link there (it could point outside the root folder)
+        if (is_link($dest) || !fm_mkdir($dest, $force)) {
             return false;
         }
 
@@ -5471,6 +5964,12 @@ function fm_mkdir($dir, $force)
 function fm_copy($f1, $f2, $upd)
 {
     $time1 = filemtime($f1);
+    if (is_link($f2)) {
+        // never write through a link into its target: replace the link itself (overwrite only)
+        if ($upd || !unlink($f2)) {
+            return false;
+        }
+    }
     if (file_exists($f2)) {
         $time2 = filemtime($f2);
         if ($time2 >= $time1 && $upd) {
@@ -5482,6 +5981,456 @@ function fm_copy($f1, $f2, $upd)
         touch($f2, $time1);
     }
     return $ok;
+}
+
+/**
+ * A name that is free in $dir: "report (1).pdf", "report (2).pdf", "photos (1)", ".env (1)"
+ * @return string|false
+ */
+function fm_free_name($dir, $name, $is_dir = false)
+{
+    // $is_dir: the item being placed is a folder (its whole name is kept, "photos.v2 (1)")
+    $dot = strrpos($name, '.');
+    if ($is_dir || $dot === false || $dot === 0) {
+        $base = $name;
+        $ext = '';
+    } else {
+        $base = substr($name, 0, $dot);
+        $ext = substr($name, $dot);
+    }
+    for ($i = 1; $i <= 1000; $i++) {
+        $try = $base . ' (' . $i . ')' . $ext;
+        $full = rtrim($dir, '/') . '/' . $try;
+        if (!file_exists($full) && !is_link($full)) return $try;
+    }
+    return false;
+}
+
+/**
+ * Copy or move one item into a folder, handling a name that already exists there.
+ * $conflict: skip (leave the existing item alone), overwrite (replace files, merge folders) or keep (save under a free name)
+ * $dest_rel is the destination folder relative to the root folder (to check hidden items)
+ * @return array [status => ok|skipped|renamed|failed, name => name used, why => reason]
+ */
+function fm_place_item($from, $dest_dir, $dest_rel, $move, $conflict)
+{
+    $name = basename($from);
+    $dest = rtrim($dest_dir, '/') . '/' . $name;
+    $res = array('status' => 'ok', 'name' => $name, 'why' => '');
+    if (!file_exists($from) && !is_link($from)) {
+        return array('status' => 'failed', 'name' => $name, 'why' => 'it is no longer there');
+    }
+    if (is_dir($from) && !is_link($from) && strpos(rtrim($dest_dir, '/') . '/', $from . '/') === 0) {
+        return array('status' => 'failed', 'name' => $name, 'why' => 'a folder can\'t go inside itself');
+    }
+    if ($move && !is_dir($from) && !fm_is_valid_ext($name)) {
+        return array('status' => 'failed', 'name' => $name, 'why' => 'this file type is not allowed');
+    }
+    $exists = file_exists($dest) || is_link($dest);
+    if ($exists) {
+        if ($conflict === 'keep') {
+            $free = fm_free_name($dest_dir, $name, is_dir($from) && !is_link($from));
+            if ($free === false) return array('status' => 'failed', 'name' => $name, 'why' => 'no free name was found');
+            $dest = rtrim($dest_dir, '/') . '/' . $free;
+            $res = array('status' => 'renamed', 'name' => $free, 'why' => '');
+            $exists = false;
+        } elseif ($conflict === 'overwrite') {
+            if (fm_path_hidden(trim($dest_rel . '/' . $name, '/'))) {
+                return array('status' => 'failed', 'name' => $name, 'why' => 'the item there is protected');
+            }
+            $from_dir = is_dir($from) && !is_link($from);
+            $dest_dir_item = is_dir($dest) && !is_link($dest);
+            if ($from_dir !== $dest_dir_item) {
+                return array('status' => 'failed', 'name' => $name, 'why' => $from_dir ? 'a file with that name is there' : 'a folder with that name is there');
+            }
+        } else {
+            return array('status' => 'skipped', 'name' => $name, 'why' => '');
+        }
+    }
+    if (!$exists) {
+        $ok = $move ? @rename($from, $dest) : fm_rcopy($from, $dest, false);
+    } elseif (is_dir($dest) && !is_link($dest)) {
+        // overwrite a folder = merge: same-named files inside are replaced, others are kept
+        $ok = fm_rcopy($from, $dest, false);
+        if ($ok && $move) {
+            $ok = fm_rdelete($from);
+            if (!$ok) return array('status' => 'failed', 'name' => $name, 'why' => 'it was copied, but the original could not be removed');
+        }
+        if (!$ok) return array('status' => 'failed', 'name' => $name, 'why' => 'only part of it could be merged (check permissions, or a file and folder share a name inside)');
+    } else {
+        // overwrite a file or link: replace it
+        if ($move) {
+            $ok = @rename($from, $dest);
+        } else {
+            $ok = (!is_link($dest) || @unlink($dest)) && fm_rcopy($from, $dest, false);
+        }
+    }
+    if (!$ok) {
+        return array('status' => 'failed', 'name' => $name, 'why' => 'check the permissions of both folders');
+    }
+    return $res;
+}
+
+/**
+ * Bold, escaped list of names: at most $max, then "and N more"
+ */
+function fm_name_list($names, $max = 10)
+{
+    $out = array();
+    foreach (array_slice($names, 0, $max) as $n) $out[] = '<b>' . fm_enc($n) . '</b>';
+    $more = count($names) - count($out);
+    return implode(', ', $out) . ($more > 0 ? sprintf(' and %d more', $more) : '');
+}
+
+/**
+ * One flash message for a copy/move run, naming every item that was skipped, renamed or failed
+ */
+function fm_copy_report($move, $where, $results)
+{
+    $by = array('ok' => array(), 'skipped' => array(), 'renamed' => array(), 'failed' => array());
+    foreach ($results as $r) $by[$r['status']][] = $r;
+    $verb = $move ? 'Moved' : 'Copied';
+    $base = $move ? 'move' : 'copy';
+    $done = count($by['ok']) + count($by['renamed']);
+    $parts = array();
+    if ($done) {
+        $parts[] = sprintf('%s %d %s to <b>%s</b>.', $verb, $done, $done == 1 ? 'item' : 'items', fm_enc($where));
+    }
+    if ($by['renamed']) {
+        $list = array();
+        foreach ($by['renamed'] as $r) $list[] = $r['name'];
+        $parts[] = sprintf('Saved under a new name because the name was taken: %s.', fm_name_list($list));
+    }
+    if ($by['skipped']) {
+        $list = array();
+        foreach ($by['skipped'] as $r) $list[] = $r['name'];
+        $n = count($list);
+        $parts[] = sprintf('%s %d %s that already %s in <b>%s</b>: %s. Choose <i>Overwrite</i> or <i>Keep both</i> to %s %s.', $done ? 'Skipped' : 'Nothing was ' . strtolower($verb) . '. Skipped', $n, $n == 1 ? 'item' : 'items', $n == 1 ? 'exists' : 'exist', fm_enc($where), fm_name_list($list), $base, $n == 1 ? 'it' : 'them');
+    }
+    if ($by['failed']) {
+        $list = array();
+        foreach (array_slice($by['failed'], 0, 10) as $r) $list[] = '<b>' . fm_enc($r['name']) . '</b> (' . fm_enc($r['why']) . ')';
+        $more = count($by['failed']) - count($list);
+        $parts[] = sprintf('Could not %s: %s%s.', $base, implode(', ', $list), $more > 0 ? sprintf(' and %d more', $more) : '');
+    }
+    $type = $by['failed'] ? 'error' : ($by['skipped'] ? 'alert' : 'ok');
+    fm_set_msg(implode(' ', $parts), $type);
+}
+
+/* ---- Self-update from GitHub Releases ---------------------------------------------------------------
+ * A release counts only when its tag is v<major>.<minor>.<patch> (the fork also carries the original
+ * project's 2.x tags) and it has two files: tinyfilemanager.php and tinyfilemanager.php.sha256.
+ * Install: download -> checksum -> it must say it is that version -> PHP syntax check -> keep the running
+ * version as <file>.<version>.bak -> replace atomically -> request the new file once (self-test) -> on any
+ * failure put the old file back. settings.php (users, root folder, logos) is never touched.
+ */
+function fm_update_source()
+{
+    return array(
+        'api' => 'https://api.github.com/repos/exavitech/tinyfilemanagerPlusPlus/releases?per_page=30',
+        'page' => 'https://github.com/exavitech/tinyfilemanagerPlusPlus/releases',
+        'asset' => 'tinyfilemanager.php',
+        'scheme' => 'https',
+        'hosts' => array('api.github.com', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'),
+    );
+}
+
+/**
+ * GET from GitHub only: https, known hosts on every redirect hop, a size limit
+ * @return array [http code, body, error message]
+ */
+function fm_update_http($url, $max = 10485760)
+{
+    if (!function_exists('curl_init')) return array(0, '', 'the PHP curl extension is missing');
+    if (fm_fn_disabled('curl_exec')) return array(0, '', 'curl_exec is in disable_functions on this server');
+    $src = fm_update_source();
+    for ($hop = 0; $hop < 6; $hop++) {
+        $u = parse_url((string) $url);
+        if (!$u || empty($u['scheme']) || strtolower($u['scheme']) !== $src['scheme'] || empty($u['host'])
+            || !in_array(strtolower($u['host']), $src['hosts'], true) || isset($u['user']) || isset($u['pass'])) {
+            return array(0, '', 'a download from ' . (isset($u['host']) ? $u['host'] : 'an unknown address') . ' was refused');
+        }
+        $body = '';
+        $too_big = false;
+        $ch = curl_init($url);
+        curl_setopt_array($ch, array(
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_TIMEOUT => 60,
+            CURLOPT_USERAGENT => 'TinyFileManagerPlusPlus/' . VERSION,
+            CURLOPT_HTTPHEADER => array('Accept: ' . (strtolower($u['host']) === 'api.github.com' ? 'application/vnd.github+json' : 'application/octet-stream')),
+            CURLOPT_WRITEFUNCTION => function ($ch, $chunk) use (&$body, &$too_big, $max) {
+                if (strlen($body) + strlen($chunk) > $max) {
+                    $too_big = true;
+                    return 0;
+                }
+                $body .= $chunk;
+                return strlen($chunk);
+            },
+        ));
+        if (defined('CURLOPT_PROTOCOLS')) curl_setopt($ch, CURLOPT_PROTOCOLS, $src['scheme'] === 'https' ? CURLPROTO_HTTPS : CURLPROTO_HTTP);
+        $ok = curl_exec($ch);
+        $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $next = (string) curl_getinfo($ch, CURLINFO_REDIRECT_URL);
+        $err = curl_error($ch);
+        curl_close($ch);
+        if ($too_big) return array(0, '', 'the download was larger than expected');
+        if ($ok === false) return array(0, '', 'GitHub could not be reached (' . $err . ')');
+        if ($code >= 300 && $code < 400 && $next !== '') {
+            $url = $next;
+            continue;
+        }
+        return array($code, $body, $code === 200 ? '' : 'GitHub answered with HTTP ' . $code);
+    }
+    return array(0, '', 'too many redirects');
+}
+
+function fm_update_cache_file()
+{
+    return dirname($GLOBALS['settings_file']) . '/.tfmpp-update.json';
+}
+
+function fm_update_nonce_file()
+{
+    return dirname($GLOBALS['settings_file']) . '/.tfmpp-ping';
+}
+
+function fm_update_cache_save($d)
+{
+    $f = fm_update_cache_file();
+    if (!is_link($f)) @file_put_contents($f, json_encode($d), LOCK_EX);
+}
+
+/**
+ * The last check, if it was made by this version (an update makes it stale)
+ */
+function fm_update_cached()
+{
+    $f = fm_update_cache_file();
+    $d = is_file($f) && !is_link($f) ? json_decode((string) @file_get_contents($f), true) : null;
+    return is_array($d) && !empty($d['checked']) && isset($d['current']) && $d['current'] === VERSION ? $d : null;
+}
+
+/**
+ * The kept earlier version: [path, version] or null
+ */
+function fm_update_backup()
+{
+    foreach ((array) glob(__FILE__ . '.*.bak') as $f) {
+        if (preg_match('/\.(\d+\.\d+\.\d+)\.bak$/', $f, $m) && is_file($f) && !is_link($f)) return array($f, $m[1]);
+    }
+    return null;
+}
+
+/**
+ * Ask GitHub which release is the newest (cached for a day unless $force)
+ */
+function fm_update_check($force = false)
+{
+    $c = fm_update_cached();
+    if (!$force && $c && time() - (int) $c['checked'] < 86400) return $c;
+    $src = fm_update_source();
+    $out = array('ok' => false, 'current' => VERSION, 'latest' => null, 'newer' => false, 'notes' => array(), 'release' => null, 'checked' => time(), 'message' => '');
+    list($code, $body, $err) = fm_update_http($src['api'], 4194304);
+    $list = $code === 200 ? json_decode($body, true) : null;
+    if (!is_array($list)) {
+        $out['message'] = 'Could not check for updates: ' . ($err !== '' ? $err : 'GitHub sent an unexpected answer') . '.';
+        fm_update_cache_save($out); // the daily check tries again tomorrow; the button tries now
+        return $out;
+    }
+    $best = null;
+    foreach ($list as $r) {
+        if (!is_array($r) || !empty($r['draft']) || !empty($r['prerelease'])) continue;
+        if (!isset($r['tag_name']) || !preg_match('/^v(\d+\.\d+\.\d+)$/', (string) $r['tag_name'], $m)) continue;
+        $v = $m[1];
+        $asset = $sum = $digest = null;
+        foreach (isset($r['assets']) && is_array($r['assets']) ? $r['assets'] : array() as $a) {
+            if (!is_array($a) || !isset($a['name'], $a['browser_download_url'])) continue;
+            if ($a['name'] === $src['asset']) {
+                $asset = (string) $a['browser_download_url'];
+                if (!empty($a['digest']) && preg_match('/^sha256:([a-f0-9]{64})$/', (string) $a['digest'], $dm)) $digest = $dm[1];
+            } elseif ($a['name'] === $src['asset'] . '.sha256') {
+                $sum = (string) $a['browser_download_url'];
+            }
+        }
+        if ($asset === null) continue;
+        if (version_compare($v, VERSION, '>')) {
+            $out['notes'][] = array('version' => $v, 'date' => substr(isset($r['published_at']) ? (string) $r['published_at'] : '', 0, 10), 'body' => substr(isset($r['body']) ? (string) $r['body'] : '', 0, 6000));
+        }
+        if ($best === null || version_compare($v, $best['version'], '>')) $best = array('version' => $v, 'asset' => $asset, 'sum' => $sum, 'digest' => $digest);
+    }
+    usort($out['notes'], function ($a, $b) {
+        return version_compare($b['version'], $a['version']);
+    });
+    $out['ok'] = true;
+    $out['latest'] = $best ? $best['version'] : VERSION;
+    $out['newer'] = $best !== null && version_compare($best['version'], VERSION, '>');
+    $out['release'] = $out['newer'] ? $best : null;
+    fm_update_cache_save($out);
+    return $out;
+}
+
+/**
+ * What the browser gets: no download addresses, plus whether this server can update itself and what Roll back offers
+ */
+function fm_update_public($r)
+{
+    $b = fm_update_backup();
+    $pub = array();
+    foreach (array('ok', 'current', 'latest', 'newer', 'notes', 'checked', 'message', 'version', 'done') as $k) {
+        if (isset($r[$k])) $pub[$k] = $r[$k];
+    }
+    $pub['backup'] = $b ? $b[1] : null;
+    $pub['writable'] = is_writable(__FILE__) && is_writable(dirname(__FILE__));
+    $pub['page'] = fm_update_source()['page'];
+    return $pub;
+}
+
+function fm_update_version_of($code)
+{
+    return preg_match("/^define\\('VERSION', '(\\d+\\.\\d+\\.\\d+)'\\);/m", $code, $m) ? $m[1] : null;
+}
+
+function fm_update_lint($code)
+{
+    if (strncmp($code, '<?php', 5) !== 0) return 'it is not a PHP file';
+    if (defined('TOKEN_PARSE')) {
+        try {
+            token_get_all($code, TOKEN_PARSE);
+        } catch (\ParseError $e) {
+            return 'it has a PHP syntax error on line ' . $e->getLine();
+        }
+    }
+    return '';
+}
+
+/**
+ * Replace this file atomically (same folder, same mode and owner), then drop it from opcache
+ */
+function fm_update_replace($code)
+{
+    $self = __FILE__;
+    $tmp = dirname($self) . '/.' . basename($self) . '.update-' . bin2hex(random_bytes(6));
+    if (@file_put_contents($tmp, $code, LOCK_EX) !== strlen($code)) {
+        @unlink($tmp);
+        return 'the new file could not be written next to ' . basename($self);
+    }
+    @chmod($tmp, fileperms($self) & 0777);
+    if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+        @chown($tmp, fileowner($self));
+        @chgrp($tmp, filegroup($self));
+    }
+    if (!@rename($tmp, $self)) {
+        @unlink($tmp);
+        return basename($self) . ' could not be replaced';
+    }
+    clearstatcache(true, $self);
+    if (function_exists('opcache_invalidate')) @opcache_invalidate($self, true);
+    return '';
+}
+
+/**
+ * Request this file once from the web server, as a fresh visitor, and expect "tfmpp-ok <version>"
+ */
+function fm_update_selftest($want)
+{
+    $nonce = bin2hex(random_bytes(16));
+    $nf = fm_update_nonce_file();
+    if (is_link($nf) || @file_put_contents($nf, $nonce, LOCK_EX) !== 32) return 'the self-test could not be prepared (the settings folder is not writable)';
+    $https = !empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off';
+    $addr = !empty($_SERVER['SERVER_ADDR']) ? (string) $_SERVER['SERVER_ADDR'] : '127.0.0.1';
+    if (strpos($addr, ':') !== false) $addr = '[' . $addr . ']';
+    $port = !empty($_SERVER['SERVER_PORT']) ? (int) $_SERVER['SERVER_PORT'] : ($https ? 443 : 80);
+    $path = !empty($_SERVER['SCRIPT_NAME']) ? (string) $_SERVER['SCRIPT_NAME'] : '/' . basename(__FILE__);
+    $host = preg_replace('/[^A-Za-z0-9.:\[\]-]/', '', isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : 'localhost');
+    $ch = curl_init(($https ? 'https' : 'http') . '://' . $addr . ':' . $port . $path . '?fm_update_ping=' . $nonce);
+    curl_setopt_array($ch, array(
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_CONNECTTIMEOUT => 5,
+        CURLOPT_TIMEOUT => 20,
+        CURLOPT_SSL_VERIFYPEER => false, // this server itself, by address
+        CURLOPT_SSL_VERIFYHOST => 0,
+        CURLOPT_HTTPHEADER => array('Host: ' . $host),
+    ));
+    $body = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err = curl_error($ch);
+    curl_close($ch);
+    @unlink($nf);
+    if ($body === false) return 'the self-test could not reach this web server (' . $err . ')';
+    if ($code !== 200 || trim((string) $body) !== 'tfmpp-ok ' . $want) {
+        $said = trim(preg_replace('/\s+/', ' ', strip_tags((string) $body)));
+        return 'the new version did not start correctly (HTTP ' . $code . ($said !== '' ? ': ' . substr($said, 0, 160) : '') . ')';
+    }
+    return '';
+}
+
+function fm_update_install()
+{
+    @set_time_limit(180);
+    $fail = function ($m) {
+        return array('ok' => false, 'current' => VERSION, 'message' => $m);
+    };
+    $self = __FILE__;
+    if (!is_writable($self) || !is_writable(dirname($self))) {
+        return $fail('This server can\'t update the app itself: PHP may not write ' . basename($self) . ' or its folder. Download the new version from GitHub and replace the file by hand.');
+    }
+    $info = fm_update_check(true);
+    if (!$info['ok']) return $fail($info['message']);
+    if (!$info['newer']) return $fail('You already have the latest version (' . VERSION . ').');
+    $rel = $info['release'];
+    list($code, $new, $err) = fm_update_http($rel['asset']);
+    if ($code !== 200) return $fail('The new version could not be downloaded: ' . $err . '.');
+    $want = '';
+    if ($rel['sum']) {
+        list($c2, $txt) = fm_update_http($rel['sum'], 4096);
+        if ($c2 === 200 && preg_match('/\b([a-f0-9]{64})\b/i', $txt, $m)) $want = strtolower($m[1]);
+    }
+    if ($want === '' && !empty($rel['digest'])) $want = $rel['digest'];
+    if ($want === '') return $fail('Release ' . $rel['version'] . ' has no checksum, so it was not installed.');
+    if (!hash_equals($want, hash('sha256', $new))) return $fail('The download does not match the checksum of release ' . $rel['version'] . ', so it was not installed.');
+    if (fm_update_version_of($new) !== $rel['version']) return $fail('The downloaded file is not version ' . $rel['version'] . ', so it was not installed.');
+    if (($lint = fm_update_lint($new)) !== '') return $fail('The downloaded file was refused: ' . $lint . '.');
+    // keep the running version for Roll back (one backup only)
+    $old = (string) file_get_contents($self);
+    foreach ((array) glob($self . '.*.bak') as $f) @unlink($f);
+    $bak = $self . '.' . VERSION . '.bak';
+    if (@file_put_contents($bak, $old, LOCK_EX) !== strlen($old)) return $fail('A backup of the current version could not be saved, so nothing was changed.');
+    @chmod($bak, 0600);
+    if (($e = fm_update_replace($new)) !== '') {
+        @unlink($bak);
+        return $fail('Nothing was changed: ' . $e . '.');
+    }
+    if (($e = fm_update_selftest($rel['version'])) !== '') {
+        $back = fm_update_replace($old);
+        if ($back === '') @unlink($bak);
+        return $fail('The update was undone because ' . $e . '.' . ($back !== '' ? ' Putting the old file back failed too (' . $back . '); it is saved as ' . basename($bak) . '.' : ' Version ' . VERSION . ' is running as before.'));
+    }
+    fm_update_cache_save(array('ok' => true, 'current' => $rel['version'], 'latest' => $rel['version'], 'newer' => false, 'notes' => array(), 'release' => null, 'checked' => time(), 'message' => ''));
+    return array('ok' => true, 'done' => true, 'version' => $rel['version'], 'current' => $rel['version'], 'message' => 'Updated to version ' . $rel['version'] . '.');
+}
+
+function fm_update_rollback()
+{
+    $fail = function ($m) {
+        return array('ok' => false, 'current' => VERSION, 'message' => $m);
+    };
+    $b = fm_update_backup();
+    if (!$b) return $fail('There is no earlier version to go back to.');
+    if (!is_writable(__FILE__) || !is_writable(dirname(__FILE__))) return $fail('PHP may not write ' . basename(__FILE__) . ' or its folder, so nothing was changed.');
+    $code = (string) file_get_contents($b[0]);
+    if (fm_update_version_of($code) !== $b[1] || fm_update_lint($code) !== '') return $fail('The saved earlier version is damaged, so nothing was changed.');
+    $cur = (string) file_get_contents(__FILE__);
+    if (($e = fm_update_replace($code)) !== '') return $fail('Nothing was changed: ' . $e . '.');
+    // versions from before the updater have no self-test to answer
+    if (strpos($code, 'fm_update_ping') !== false && ($e = fm_update_selftest($b[1])) !== '') {
+        fm_update_replace($cur);
+        return $fail('The roll back was undone because ' . $e . '.');
+    }
+    @unlink($b[0]);
+    @unlink(fm_update_cache_file());
+    return array('ok' => true, 'done' => true, 'version' => $b[1], 'current' => $b[1], 'message' => 'Rolled back to version ' . $b[1] . '.');
 }
 
 /**
@@ -5719,6 +6668,14 @@ function fm_is_exclude_items($name, $path)
         }
     }
     if (in_array($lpath, $own, true)) return false;
+    // the updater's files: the kept earlier version, the check cache, the self-test code and a half-written update
+    static $upd = null;
+    if ($upd === null) {
+        $self = strtolower(str_replace('\\', '/', __FILE__));
+        $sdir = strtolower(str_replace('\\', '/', dirname($GLOBALS['settings_file'])));
+        $upd = array($self, dirname($self) . '/.' . basename($self) . '.update-', array($sdir . '/.tfmpp-update.json', $sdir . '/.tfmpp-ping', $sdir . '/tfmpp-errors.php', $sdir . '/tfmpp-errors.1.php', $sdir . '/.tfmpp-errors-seen'));
+    }
+    if ((strpos($lpath, $upd[0] . '.') === 0 && substr($lpath, -4) === '.bak') || strpos($lpath, $upd[1]) === 0 || in_array($lpath, $upd[2], true)) return false;
     foreach ($rules as $r) {
         $subject = $r[1] ? $lpath : $lname;
         if ($subject === $r[0] || ($r[2] && fnmatch($r[0], $subject))) {
@@ -6104,10 +7061,863 @@ function fm_env_level($pct, $warn = 80, $bad = 90)
     return $pct >= $bad ? 'is-bad' : ($pct >= $warn ? 'is-warn' : '');
 }
 
-/** Is a program installed? (fixed names only) */
+/** Is a program installed? (fixed names only). Without a shell, look in the usual program folders. */
 function fm_env_has($bin)
 {
-    return preg_match('/^[a-z0-9._-]+$/i', $bin) && fm_env_run('which ' . $bin, 3) !== '';
+    if (!preg_match('/^[a-z0-9._-]+$/i', $bin)) return false;
+    if (fm_env_shell_ok()) return fm_env_run('which ' . $bin, 3) !== '';
+    foreach (array('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin') as $d) {
+        if (@is_executable($d . '/' . $bin)) return true;
+    }
+    return false;
+}
+
+/** Can the Environment page run commands? Hardened PHP pools often list shell_exec in disable_functions. */
+function fm_env_shell_ok()
+{
+    return function_exists('shell_exec');
+}
+
+/**
+ * Version of an installed Debian/Ubuntu package, read from the dpkg database (no command needed).
+ * $names: package names or wildcards, tried in order. "1:2.43.0-1ubuntu7" -> "2.43.0". '' if none is installed.
+ */
+function fm_env_pkg_version($names)
+{
+    static $pkgs = null;
+    if ($pkgs === null) {
+        $pkgs = array();
+        $fh = @fopen('/var/lib/dpkg/status', 'r');
+        $name = $ver = '';
+        $ok = false;
+        while ($fh && ($l = fgets($fh)) !== false) {
+            if (strncmp($l, 'Package: ', 9) === 0) $name = trim(substr($l, 9));
+            elseif (strncmp($l, 'Status: ', 8) === 0) $ok = trim(substr($l, 8)) === 'install ok installed';
+            elseif (strncmp($l, 'Version: ', 9) === 0) $ver = trim(substr($l, 9));
+            elseif (trim($l) === '') {
+                if ($ok && $name !== '' && $ver !== '') $pkgs[$name] = $ver;
+                $name = $ver = '';
+                $ok = false;
+            }
+        }
+        if ($fh) fclose($fh);
+        if ($ok && $name !== '' && $ver !== '') $pkgs[$name] = $ver;
+    }
+    foreach ((array) $names as $n) {
+        $hits = strpbrk($n, '*?[') ? array_values(array_filter(array_keys($pkgs), function ($k) use ($n) { return fnmatch($n, $k); })) : (isset($pkgs[$n]) ? array($n) : array());
+        if (!$hits) continue;
+        natsort($hits);
+        $v = preg_replace('/^\d+:/', '', $pkgs[end($hits)]); // drop the epoch
+        if (preg_match('/^(\d+(?:\.\d+)+)/', $v, $m)) return $m[1];
+    }
+    return '';
+}
+
+/**
+ * PHP-FPM pools: the distro pool folders plus the configs of FPM masters running from elsewhere
+ * (a separate service such as php-fpm -y /etc/x/php-fpm.conf). Read from files and /proc only.
+ */
+function fm_env_fpm_pools()
+{
+    static $pools = null;
+    if ($pools !== null) return $pools;
+    $files = array();
+    foreach ((glob('/etc/php/*/fpm/pool.d/*.conf') ?: array()) as $f) {
+        $files[$f] = basename(dirname(dirname(dirname($f))));
+    }
+    $masters = array();
+    foreach ((glob('/proc/[0-9]*/cmdline') ?: array()) as $c) {
+        $cmd = (string) @file_get_contents($c);
+        if (!preg_match('/^php-fpm: master process \((\/[^)\0]+)\)/', $cmd, $m) || !is_readable($m[1])) continue;
+        $ver = preg_match('/php-?fpm(\d+\.\d+)/', (string) @readlink(dirname($c) . '/exe'), $v) ? $v[1] : '';
+        $files[$m[1]] = $ver;
+        $masters[$m[1]] = $ver;
+        // pools pulled in with include= (absolute, or relative to the config's folder)
+        if (preg_match_all('/^\s*include\s*=\s*(\S+)/m', (string) @file_get_contents($m[1]), $inc)) {
+            foreach ($inc[1] as $pat) {
+                if ($pat[0] !== '/') $pat = dirname($m[1]) . '/' . $pat;
+                foreach ((glob($pat) ?: array()) as $f) if (!isset($files[$f])) $files[$f] = $ver;
+            }
+        }
+    }
+    $pools = $seen = array();
+    foreach ($files as $f => $ver) {
+        $real = realpath($f);
+        if ($real === false || isset($seen[$real])) continue;
+        $seen[$real] = 1;
+        // one file can hold [global] and several [pool] sections
+        foreach (preg_split('/^\s*(?=\[[^\]]+\])/m', (string) @file_get_contents($real)) as $sec) {
+            if (!preg_match('/^\[([^\]]+)\]/', $sec, $name) || $name[1] === 'global') continue;
+            $get = function ($k) use ($sec) {
+                return preg_match('/^\s*' . preg_quote($k, '/') . '\s*=\s*(.+)$/m', $sec, $m) ? trim($m[1]) : '';
+            };
+            $pools[] = array('version' => $ver, 'name' => $name[1], 'user' => $get('user'), 'listen' => $get('listen'), 'pm' => $get('pm'), 'max' => $get('pm.max_children'), 'file' => $real, 'section' => $sec);
+        }
+    }
+    return $pools;
+}
+
+/** "\040" in /proc/self/mounts -> " " */
+function fm_env_unoct($s)
+{
+    return preg_replace_callback('/\\\\([0-7]{3})/', function ($m) {
+        return chr(octdec($m[1]));
+    }, $s);
+}
+
+/** A hex address from /proc/net (32-bit words, little-endian) -> "10.0.0.5" or "2001:db8::1" */
+function fm_env_hex_ip($hex)
+{
+    $bin = '';
+    foreach (str_split($hex, 8) as $w) $bin .= strrev((string) @hex2bin($w));
+    $ip = strlen($bin) === 4 || strlen($bin) === 16 ? @inet_ntop($bin) : false;
+    return $ip === false ? '' : $ip;
+}
+
+/** Virtualisation without systemd-detect-virt: container markers, then the DMI vendor */
+function fm_env_virt_file()
+{
+    if (preg_match('/(?:^|\0)container=([^\0]+)/', (string) @file_get_contents('/proc/1/environ'), $m)) return $m[1];
+    if (@is_file('/.dockerenv')) return 'docker';
+    if (strpos((string) @file_get_contents('/sys/devices/system/clocksource/clocksource0/available_clocksource'), 'kvm-clock') !== false) return 'kvm';
+    $v = strtolower(trim((string) @file_get_contents('/sys/class/dmi/id/sys_vendor')) . ' ' . trim((string) @file_get_contents('/sys/class/dmi/id/product_name')));
+    foreach (array('kvm' => 'kvm', 'qemu' => 'qemu', 'vmware' => 'vmware', 'microsoft' => 'microsoft', 'xen' => 'xen', 'virtualbox' => 'oracle', 'innotek' => 'oracle',
+        'amazon ec2' => 'amazon', 'google compute' => 'google', 'openstack' => 'kvm', 'bochs' => 'bochs', 'parallels' => 'parallels', 'hetzner' => 'kvm') as $k => $name) {
+        if (strpos($v, $k) !== false) return $name;
+    }
+    if (preg_match('/^flags\s*:.*\bhypervisor\b/m', (string) @file_get_contents('/proc/cpuinfo'))) return 'virtual machine';
+    return '';
+}
+
+/** Timezone without timedatectl: the /etc/localtime link, then /etc/timezone */
+function fm_env_tz_file()
+{
+    $l = (string) @readlink('/etc/localtime');
+    if (preg_match('#zoneinfo/(.+)$#', $l, $m)) return $m[1];
+    return trim((string) @file_get_contents('/etc/timezone'));
+}
+
+/** Mounted file systems from /proc/self/mounts, sized with disk_total_space() (no df) */
+function fm_env_disks_proc()
+{
+    $skip = array('proc', 'sysfs', 'tmpfs', 'devtmpfs', 'devpts', 'cgroup', 'cgroup2', 'overlay', 'squashfs', 'nsfs', 'efivarfs', 'securityfs', 'pstore', 'bpf', 'tracefs',
+        'debugfs', 'mqueue', 'hugetlbfs', 'fusectl', 'configfs', 'autofs', 'binfmt_misc', 'rpc_pipefs', 'ramfs', 'fuse.lxcfs', 'fuse.snapfuse', 'nfsd', 'selinuxfs', 'fuse.gvfsd-fuse');
+    $disks = $seen = array();
+    foreach ((@file('/proc/self/mounts', FILE_IGNORE_NEW_LINES) ?: array()) as $l) {
+        $c = explode(' ', $l);
+        if (count($c) < 3 || in_array($c[2], $skip, true) || isset($seen[$c[0]])) continue;
+        $mount = fm_env_unoct($c[1]);
+        $size = @disk_total_space($mount);
+        $free = @disk_free_space($mount);
+        if (!$size || $free === false) continue;
+        $seen[$c[0]] = 1;
+        $used = $size - $free;
+        $disks[] = array('dev' => fm_env_unoct($c[0]), 'type' => $c[2], 'size' => (float) $size, 'used' => (float) $used, 'avail' => (float) $free,
+            'pct' => (int) round($used / $size * 100), 'mount' => $mount, 'ipct' => null, 'inodes' => 0);
+    }
+    return $disks;
+}
+
+/** Block devices from /sys/block (no lsblk) */
+function fm_env_blocks_sys()
+{
+    $mounts = array();
+    foreach ((@file('/proc/self/mounts', FILE_IGNORE_NEW_LINES) ?: array()) as $l) {
+        $c = explode(' ', $l);
+        if (count($c) >= 3 && strpos($c[0], '/dev/') === 0 && !isset($mounts[basename($c[0])])) $mounts[basename($c[0])] = array($c[2], fm_env_unoct($c[1]));
+    }
+    $row = function ($name, $dir, $type, $depth) use ($mounts) {
+        return array('name' => $name, 'size' => (float) @file_get_contents($dir . '/size') * 512, 'type' => $type,
+            'fs' => isset($mounts[$name]) ? $mounts[$name][0] : '', 'mount' => isset($mounts[$name]) ? $mounts[$name][1] : '',
+            'model' => $depth ? '' : trim((string) @file_get_contents($dir . '/device/model')), 'depth' => $depth);
+    };
+    $out = array();
+    foreach ((glob('/sys/block/*') ?: array()) as $d) {
+        $n = basename($d);
+        if (preg_match('/^(loop|ram|zram)/', $n)) continue;
+        $out[] = $row($n, $d, strpos($n, 'dm-') === 0 ? 'lvm' : (strpos($n, 'sr') === 0 ? 'rom' : 'disk'), 0);
+        foreach ((glob($d . '/' . $n . '*') ?: array()) as $part) $out[] = $row(basename($part), $part, 'part', 1);
+    }
+    return $out;
+}
+
+/** The busiest processes from /proc (no ps): CPU over 0.2 s, memory from RSS */
+function fm_env_processes_proc()
+{
+    $page = 4096;
+    $hz = 100;
+    $cpu_total = function () {
+        return preg_match('/^cpu\s+(.+)$/m', (string) @file_get_contents('/proc/stat'), $m) ? array_sum(preg_split('/\s+/', trim($m[1]))) : 0;
+    };
+    $snap = function () {
+        $s = array();
+        foreach ((glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: array()) as $d) {
+            $st = (string) @file_get_contents($d . '/stat');
+            $o = strpos($st, '(');
+            $r = strrpos($st, ')');
+            if ($o === false || $r === false) continue;
+            $f = explode(' ', substr($st, $r + 2)); // [0] = field 3 (state)
+            if (count($f) < 22) continue;
+            $s[(int) basename($d)] = array('comm' => substr($st, $o + 1, $r - $o - 1), 'cpu' => (float) $f[11] + (float) $f[12], 'start' => (float) $f[19], 'rss' => (float) $f[21]);
+        }
+        return $s;
+    };
+    $t1 = $cpu_total();
+    $a = $snap();
+    usleep(200000);
+    $t2 = $cpu_total();
+    $b = $snap();
+    $threads = max(1, preg_match_all('/^processor\s*:/m', (string) @file_get_contents('/proc/cpuinfo')));
+    $memtotal = preg_match('/^MemTotal:\s+(\d+)/m', (string) @file_get_contents('/proc/meminfo'), $mm) ? $mm[1] * 1024 : 0;
+    $uptime = (float) @file_get_contents('/proc/uptime');
+    $dt = max(1, $t2 - $t1);
+    $rows = array();
+    foreach ($b as $pid => $p) {
+        $cpu = isset($a[$pid]) ? max(0, $p['cpu'] - $a[$pid]['cpu']) / $dt * 100 * $threads : 0;
+        $rows[] = array('pid' => (string) $pid, 'user' => '', 'cpu' => round($cpu, 1), 'mem' => $memtotal ? round($p['rss'] * $page / $memtotal * 100, 1) : 0,
+            'rss' => $p['rss'] * $page, 'age' => (int) max(0, $uptime - $p['start'] / $hz), 'cmd' => $p['comm']);
+    }
+    $names = array();
+    $top = function ($key) use ($rows, &$names) {
+        usort($rows, function ($x, $y) use ($key) {
+            return $y[$key] <=> $x[$key];
+        });
+        $rows = array_slice($rows, 0, 15);
+        foreach ($rows as &$r) {
+            $uid = preg_match('/^Uid:\s+(\d+)/m', (string) @file_get_contents('/proc/' . $r['pid'] . '/status'), $u) ? (int) $u[1] : -1;
+            if (!isset($names[$uid])) $names[$uid] = $uid >= 0 && function_exists('posix_getpwuid') && ($pw = @posix_getpwuid($uid)) ? $pw['name'] : ($uid >= 0 ? (string) $uid : '?');
+            $r['user'] = $names[$uid];
+        }
+        return $rows;
+    };
+    return array('cpu' => $top('cpu'), 'mem' => $top('rss'), 'count' => count($b));
+}
+
+/** Listening ports from /proc/net (no ss); program names from /proc/<pid>/fd socket links when readable */
+function fm_env_ports_proc()
+{
+    $ports = $inodes = array();
+    foreach (array('tcp' => 'tcp', 'tcp6' => 'tcp', 'udp' => 'udp', 'udp6' => 'udp') as $f => $proto) {
+        foreach (array_slice(@file('/proc/net/' . $f, FILE_IGNORE_NEW_LINES) ?: array(), 1) as $l) {
+            $c = preg_split('/\s+/', trim($l));
+            if (count($c) < 10 || $c[3] !== ($proto === 'tcp' ? '0A' : '07')) continue; // TCP LISTEN, UDP unconnected
+            $lp = explode(':', $c[1]);
+            if (count($lp) !== 2) continue;
+            $addr = fm_env_hex_ip($lp[0]);
+            if ($addr === '') continue;
+            $port = (string) hexdec($lp[1]);
+            $k = $proto . $port . $addr;
+            if (isset($ports[$k])) continue;
+            $ports[$k] = array('proto' => $proto, 'port' => $port, 'addr' => $addr, 'proc' => '', 'inode' => $c[9],
+                'public' => !preg_match('/^(127\.|::1$|::ffff:127\.)/', $addr));
+            $inodes[$c[9]] = $k;
+        }
+    }
+    if ($inodes) {
+        $found = 0;
+        foreach ((glob('/proc/[0-9]*', GLOB_ONLYDIR) ?: array()) as $d) {
+            $fds = @scandir($d . '/fd');
+            if (!$fds) continue;
+            foreach ($fds as $fd) {
+                if ($fd === '.' || $fd === '..') continue;
+                $t = (string) @readlink($d . '/fd/' . $fd);
+                if (strncmp($t, 'socket:[', 8) !== 0) continue;
+                $ino = substr($t, 8, -1);
+                if (!isset($inodes[$ino])) continue;
+                $k = $inodes[$ino];
+                // socket activation: pid 1 (systemd) holds the socket too, so keep looking for the real program
+                if ($ports[$k]['proc'] === '' || $ports[$k]['proc'] === '@1') {
+                    $ports[$k]['proc'] = basename($d) === '1' ? '@1' : trim((string) @file_get_contents($d . '/comm'));
+                    if ($ports[$k]['proc'] !== '@1') $found++;
+                }
+            }
+            if ($found >= count($inodes)) break;
+        }
+    }
+    foreach ($ports as &$p) {
+        if ($p['proc'] === '@1') $p['proc'] = trim((string) @file_get_contents('/proc/1/comm'));
+        unset($p['inode']);
+    }
+    return array_values($ports);
+}
+
+/** Network interfaces from /sys and /proc (no ip): IPv4 via fib_trie + routes, IPv6 via if_inet6 */
+function fm_env_ifs_proc()
+{
+    $routes = array();
+    foreach (array_slice(@file('/proc/net/route', FILE_IGNORE_NEW_LINES) ?: array(), 1) as $l) {
+        $c = preg_split('/\s+/', trim($l));
+        if (count($c) < 8) continue;
+        $mask = fm_env_hex_ip($c[7]);
+        if ($mask === '' || $mask === '0.0.0.0') continue;
+        $routes[] = array($c[0], ip2long(fm_env_hex_ip($c[1])), ip2long($mask), substr_count(decbin(ip2long($mask)), '1'));
+    }
+    $v4 = array();
+    if (preg_match_all('/\|--\s+(\d+\.\d+\.\d+\.\d+)\s*\n\s*\/32 host LOCAL/', (string) @file_get_contents('/proc/net/fib_trie'), $m)) {
+        foreach (array_unique($m[1]) as $ip) {
+            if (strpos($ip, '127.') === 0) {
+                $v4['lo'][] = $ip . '/8';
+                continue;
+            }
+            $long = ip2long($ip);
+            foreach ($routes as $r) {
+                if (($long & $r[2]) === ($r[1] & $r[2])) {
+                    $v4[$r[0]][] = $ip . '/' . $r[3];
+                    break;
+                }
+            }
+        }
+    }
+    $v6 = array();
+    foreach ((@file('/proc/net/if_inet6', FILE_IGNORE_NEW_LINES) ?: array()) as $l) {
+        $c = preg_split('/\s+/', trim($l));
+        if (count($c) < 6) continue;
+        $ip = @inet_ntop((string) @hex2bin($c[0]));
+        if ($ip) $v6[$c[5]][] = $ip . '/' . hexdec($c[2]) . ($c[3] === '20' ? ' (link)' : '');
+    }
+    $ifs = array();
+    $veth = 0;
+    foreach ((glob('/sys/class/net/*') ?: array()) as $d) {
+        $n = basename($d);
+        if (strpos($n, 'veth') === 0) {
+            $veth++;
+            continue;
+        }
+        $ifs[] = array('name' => $n, 'state' => strtoupper(trim((string) @file_get_contents($d . '/operstate'))), 'mac' => trim((string) @file_get_contents($d . '/address')),
+            'addrs' => array_merge(isset($v4[$n]) ? $v4[$n] : array(), isset($v6[$n]) ? $v6[$n] : array()), 'idx' => (int) @file_get_contents($d . '/ifindex'));
+    }
+    usort($ifs, function ($a, $b) {
+        return $a['idx'] <=> $b['idx'];
+    });
+    return array($ifs, $veth);
+}
+
+/** sshd settings from the config files (no sshd -T): first value wins, Include files in place, stops at Match */
+function fm_env_sshd_file()
+{
+    $out = array();
+    $read = function ($file, $depth) use (&$read, &$out) {
+        foreach ((@file($file, FILE_IGNORE_NEW_LINES) ?: array()) as $l) {
+            if (!preg_match('/^\s*(\w+)\s+(.+?)\s*$/', $l, $m)) continue;
+            $k = strtolower($m[1]);
+            if ($k === 'match') return false;
+            if ($k === 'include' && $depth < 3) {
+                foreach (preg_split('/\s+/', $m[2]) as $pat) {
+                    if ($pat[0] !== '/') $pat = '/etc/ssh/' . $pat;
+                    foreach ((glob($pat) ?: array()) as $f) if ($read($f, $depth + 1) === false) return false;
+                }
+                continue;
+            }
+            if (!isset($out[$k])) $out[$k] = strtolower($m[2]);
+        }
+        return true;
+    };
+    $read('/etc/ssh/sshd_config', 0);
+    // sshd's defaults for what the page shows
+    return $out ? $out + array('port' => '22', 'permitrootlogin' => 'prohibit-password', 'passwordauthentication' => 'yes', 'pubkeyauthentication' => 'yes', 'maxauthtries' => '6', 'x11forwarding' => 'no') : array();
+}
+
+/* ======================= Setup check ======================= */
+/* What this server needs for every feature, what is missing, and the command that fixes it (shown, never run).
+ * Reads PHP settings and fixed system files only: it works with Server tools off and with shell_exec disabled. */
+
+/** "64M" -> 67108864, "-1" -> -1 */
+function fm_setup_bytes($v)
+{
+    $v = trim((string) $v);
+    if ($v === '' || $v === '-1') return $v === '-1' ? -1 : 0;
+    $n = (float) $v;
+    switch (strtolower(substr($v, -1))) {
+        case 'g': $n *= 1024;
+        case 'm': $n *= 1024;
+        case 'k': $n *= 1024;
+    }
+    return (int) $n;
+}
+
+/** OS family, PHP version, how PHP runs here and which service/config file to touch */
+function fm_setup_platform()
+{
+    static $p = null;
+    if ($p !== null) return $p;
+    $os = array();
+    foreach ((@file('/etc/os-release', FILE_IGNORE_NEW_LINES) ?: array()) as $l) {
+        if (preg_match('/^(\w+)="?(.*?)"?$/', $l, $m)) $os[$m[1]] = $m[2];
+    }
+    $ids = strtolower((isset($os['ID']) ? $os['ID'] : '') . ' ' . (isset($os['ID_LIKE']) ? $os['ID_LIKE'] : ''));
+    $family = preg_match('/\b(debian|ubuntu)\b/', $ids) ? 'debian' : (preg_match('/\b(rhel|fedora|centos|rocky|almalinux|ol)\b/', $ids) ? 'rhel' : (preg_match('/\balpine\b/', $ids) ? 'alpine' : 'other'));
+    $v = PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+    $sapi = php_sapi_name();
+    $p = array('family' => $family, 'os' => isset($os['PRETTY_NAME']) ? $os['PRETTY_NAME'] : php_uname('s'), 'php' => $v, 'sapi' => $sapi,
+        'systemd' => @is_dir('/run/systemd/system'), 'service' => '', 'master' => '', 'pool' => '', 'pool_file' => '', 'pool_section' => '',
+        'ini' => php_ini_loaded_file() ?: '', 'web' => isset($_SERVER['SERVER_SOFTWARE']) ? (string) $_SERVER['SERVER_SOFTWARE'] : '',
+        'user' => function_exists('posix_geteuid') && function_exists('posix_getpwuid') && ($pw = @posix_getpwuid(posix_geteuid())) ? $pw['name'] : get_current_user());
+    if ($sapi === 'fpm-fcgi') {
+        if (function_exists('fpm_get_status') && ($st = @fpm_get_status()) && !empty($st['pool'])) $p['pool'] = $st['pool'];
+        // the FPM master that started this worker, and the service that runs it
+        $stat = (string) @file_get_contents('/proc/self/stat');
+        $r = strrpos($stat, ')');
+        $f = $r !== false ? explode(' ', substr($stat, $r + 2)) : array();
+        if (isset($f[1]) && preg_match('/^php-fpm: master process \((\/[^)\0]+)\)/', (string) @file_get_contents('/proc/' . (int) $f[1] . '/cmdline'), $m)) $p['master'] = $m[1];
+        $conf = $p['master'];
+        if (preg_match('#^/etc/php/(\d+\.\d+)/fpm/php-fpm\.conf$#', $conf, $m)) $p['service'] = 'php' . $m[1] . '-fpm';
+        elseif ($conf === '/etc/php-fpm.conf') $p['service'] = 'php-fpm';
+        elseif (preg_match('#^/etc/php(\d+)/php-fpm\.conf$#', $conf, $m)) $p['service'] = 'php-fpm' . $m[1];
+        elseif ($conf !== '') {
+            foreach (array_merge(glob('/etc/systemd/system/*.service') ?: array(), glob('/lib/systemd/system/*.service') ?: array(), glob('/usr/lib/systemd/system/*.service') ?: array()) as $u) {
+                if (strpos((string) @file_get_contents($u), $conf) !== false) {
+                    $p['service'] = basename($u, '.service');
+                    break;
+                }
+            }
+        }
+        if ($p['service'] === '') $p['service'] = $family === 'debian' ? 'php' . $v . '-fpm' : ($family === 'alpine' ? 'php-fpm' . PHP_MAJOR_VERSION . PHP_MINOR_VERSION : 'php-fpm');
+        foreach (fm_env_fpm_pools() as $pool) {
+            if ($p['pool'] !== '' && $pool['name'] === $p['pool'] && ($p['pool_file'] === '' || ($p['master'] !== '' && strpos($pool['file'], dirname($p['master'])) === 0))) {
+                $p['pool_file'] = $pool['file'];
+                $p['pool_section'] = $pool['section'];
+            }
+        }
+    } elseif ($sapi === 'apache2handler') {
+        $p['service'] = $family === 'rhel' ? 'httpd' : 'apache2';
+    }
+    return $p;
+}
+
+/** "sudo systemctl restart php8.3-fpm", or '' when PHP isn't run by a service (php -S) */
+function fm_setup_restart($p)
+{
+    if ($p['service'] === '') return '';
+    return $p['systemd'] ? 'sudo systemctl restart ' . $p['service'] : 'sudo rc-service ' . $p['service'] . ' restart';
+}
+
+/** The install command for one PHP extension on this OS family */
+function fm_setup_php_pkg($p, $ext)
+{
+    $v = $p['php'];
+    $xy = str_replace('.', '', $v);
+    $deb = array('zip' => 'zip', 'curl' => 'curl', 'mbstring' => 'mbstring', 'opcache' => 'opcache', 'json' => 'json');
+    $rhel = array('zip' => 'php-pecl-zip', 'mbstring' => 'php-mbstring', 'posix' => 'php-process', 'opcache' => 'php-opcache');
+    switch ($p['family']) {
+        case 'debian': return 'sudo apt install -y php' . $v . '-' . (isset($deb[$ext]) ? $deb[$ext] : 'common');
+        case 'rhel': return 'sudo dnf install -y ' . (isset($rhel[$ext]) ? $rhel[$ext] : 'php-common');
+        case 'alpine': return 'sudo apk add php' . $xy . '-' . $ext;
+    }
+    return '';
+}
+
+/** Install command for a system package per family: array('debian' => 'iproute2', ...) */
+function fm_setup_os_pkg($p, $pkgs)
+{
+    $f = $p['family'];
+    if (empty($pkgs[$f])) return '';
+    return array('debian' => 'sudo apt install -y ', 'rhel' => 'sudo dnf install -y ', 'alpine' => 'sudo apk add ')[$f] . $pkgs[$f];
+}
+
+/** Where a PHP setting is changed for this app only: the pool file (FPM) or php.ini; returns [where text, lines, restart] */
+function fm_setup_ini_fix($p, $pairs)
+{
+    $lines = array();
+    $pool = $p['sapi'] === 'fpm-fcgi';
+    foreach ($pairs as $k => $v) $lines[] = $pool ? 'php_admin_value[' . $k . '] = ' . $v : $k . ' = ' . $v;
+    if ($pool) {
+        $where = $p['pool_file'] !== '' ? 'Add to the <code>[' . fm_enc($p['pool']) . ']</code> section of <code>' . fm_enc($p['pool_file']) . '</code> (this app\'s PHP-FPM pool only):' : 'Add to this app\'s PHP-FPM pool file:';
+    } else {
+        $where = 'Set in ' . ($p['ini'] !== '' ? '<code>' . fm_enc($p['ini']) . '</code>' : 'php.ini') . ':';
+    }
+    $cmds = array(array('Lines', implode("\n", $lines)));
+    if (($r = fm_setup_restart($p)) !== '') $cmds[] = array('Then restart PHP', $r);
+    return array($where, $cmds);
+}
+
+/** Where disable_functions comes from: array(file, line text, 'pool'|'ini'|'') */
+function fm_setup_disable_source($p)
+{
+    if ($p['pool_section'] !== '' && preg_match('/^[ \t]*php_(?:admin_)?value\[disable_functions\][ \t]*=[ \t]*[^\s;].*$/m', $p['pool_section'], $m)) return array($p['pool_file'], trim($m[0]), 'pool');
+    $files = array_filter(array_merge(array($p['ini']), array_map('trim', explode(',', (string) php_ini_scanned_files()))));
+    foreach ($files as $f) {
+        if (preg_match('/^[ \t]*disable_functions[ \t]*=[ \t]*[^\s;].*$/m', (string) @file_get_contents($f), $m)) return array($f, trim($m[0]), 'ini');
+    }
+    return array('', '', '');
+}
+
+/** nginx client_max_body_size values found in its config: "64m (sites-enabled/tools)" */
+function fm_setup_nginx_body()
+{
+    $out = array();
+    foreach (array_merge(array('/etc/nginx/nginx.conf'), glob('/etc/nginx/conf.d/*.conf') ?: array(), glob('/etc/nginx/sites-enabled/*') ?: array()) as $f) {
+        if (preg_match_all('/^\s*client_max_body_size\s+([^;\s]+)\s*;/m', (string) @file_get_contents($f), $m)) {
+            foreach ($m[1] as $v) $out[] = $v . ' (' . str_replace('/etc/nginx/', '', $f) . ')';
+        }
+    }
+    return array_slice(array_unique($out), 0, 6);
+}
+
+/**
+ * Every check: array(group, title, status ok|fail|warn|info, value, why, fix html, commands [[label, text]...])
+ */
+function fm_setup_checks()
+{
+    $p = fm_setup_platform();
+    $c = array();
+    $add = function ($group, $title, $status, $value, $why, $fix = '', $cmds = array()) use (&$c) {
+        $c[] = array('group' => $group, 'title' => $title, 'status' => $status, 'value' => (string) $value, 'why' => $why, 'fix' => $fix, 'cmds' => array_values(array_filter($cmds, function ($x) { return $x[1] !== ''; })));
+    };
+    $restart = fm_setup_restart($p);
+    $install = function ($ext) use ($p, $restart) {
+        return array(array('Install', fm_setup_php_pkg($p, $ext)), array('Then restart PHP', $restart));
+    };
+    $disabled = array_filter(array_map('trim', explode(',', (string) ini_get('disable_functions'))));
+
+    // ---- PHP
+    $g = 'PHP';
+    $pv = PHP_VERSION;
+    if (version_compare($pv, '7.2', '<')) $add($g, 'PHP version', 'fail', $pv, 'This app needs PHP 7.2 or newer.', 'Install a current PHP (8.2 or newer) from your distribution or a trusted repository.');
+    elseif (version_compare($pv, '8.1', '<')) $add($g, 'PHP version', 'warn', $pv, 'Works, but this PHP no longer gets security fixes.', 'Move to PHP 8.2 or newer when you can.');
+    else $add($g, 'PHP version', 'ok', $pv . ' (' . $p['sapi'] . ')', 'Supported.');
+    foreach (array(
+        'session' => array('fail', 'Sign-in', 'Without sessions nobody can sign in.'),
+        'json' => array('fail', 'Settings, uploads and every dialog', 'The app exchanges all its data as JSON.'),
+        'zip' => array('warn', 'Zip download, Zip archives and Extract', 'Downloading several items, making .zip files and unpacking them are switched off.'),
+        'phar' => array('warn', 'Tar archives', '.tar archives can\'t be made or unpacked.'),
+        'curl' => array('warn', 'Upload from URL and updates', 'Uploading from a web address and Check for updates can\'t work.'),
+        'mbstring' => array('warn', 'Non-English file names', 'Names with accents or non-Latin letters may be cut or shown wrongly.'),
+        'fileinfo' => array('warn', 'File types', 'File types are guessed from the extension only; previews may pick the wrong viewer.'),
+        'iconv' => array('warn', 'File name encodings', 'Converting file names from other encodings is off.'),
+        'posix' => array('warn', 'Owners and groups', 'The Owner column shows numbers, and updates can\'t keep the file owner.'),
+        'tokenizer' => array('info', 'Safe updates', 'The updater can\'t syntax-check a new version before installing it.'),
+        'Zend OPcache' => array('info', 'Speed', 'Without OPcache every page compiles the whole app again (slower, more CPU).'),
+    ) as $ext => $d) {
+        $name = $ext === 'Zend OPcache' ? 'opcache' : $ext;
+        if (extension_loaded($ext)) $add($g, 'Extension ' . $name, 'ok', 'loaded', $d[1] . ' work.');
+        else $add($g, 'Extension ' . $name, $d[0], 'missing', $d[1] . ': ' . $d[2], 'Install the extension, then restart PHP.', $install($name));
+    }
+
+    // ---- PHP settings
+    $g = 'PHP settings';
+    $chunk = (int) $GLOBALS['upload_chunk_size_bytes'];
+    $want = max(64 * 1048576, (int) ceil($chunk * 1.5 / 1048576) * 1048576);
+    $want_txt = (int) ($want / 1048576) . 'M';
+    if (!ini_get('file_uploads')) {
+        list($w, $cm) = fm_setup_ini_fix($p, array('file_uploads' => 'On'));
+        $add($g, 'File uploads', 'fail', 'Off', 'Upload can\'t receive any file.', $w, $cm);
+    } else {
+        $add($g, 'File uploads', 'ok', 'On', 'Uploads are accepted.');
+    }
+    $um = fm_setup_bytes(ini_get('upload_max_filesize'));
+    $pm = fm_setup_bytes(ini_get('post_max_size'));
+    $limit = min($um > 0 ? $um : PHP_INT_MAX, $pm > 0 ? $pm : PHP_INT_MAX);
+    $val = 'upload_max_filesize ' . ini_get('upload_max_filesize') . ' · post_max_size ' . ini_get('post_max_size') . ' · piece ' . fm_env_bytes($chunk);
+    if ($limit <= $chunk + 65536) {
+        list($w, $cm) = fm_setup_ini_fix($p, array('upload_max_filesize' => $want_txt, 'post_max_size' => $want_txt));
+        $add($g, 'Upload size limits', 'fail', $val, 'Uploads are sent in pieces of ' . fm_env_bytes($chunk) . ' (Settings › Uploads); PHP refuses pieces this big, so uploads fail. Raise the limits, or lower the piece size in Settings › Uploads.', $w, $cm);
+    } else {
+        $add($g, 'Upload size limits', 'ok', $val, 'Each upload piece fits.');
+    }
+    $ml = fm_setup_bytes(ini_get('memory_limit'));
+    if ($ml > 0 && $ml < 128 * 1048576) {
+        list($w, $cm) = fm_setup_ini_fix($p, array('memory_limit' => '256M'));
+        $add($g, 'Memory limit', 'warn', ini_get('memory_limit'), 'Large folders, searches and archives may stop with "Allowed memory size exhausted".', $w, $cm);
+    } else {
+        $add($g, 'Memory limit', 'ok', ini_get('memory_limit'), 'Enough for large folders and archives.');
+    }
+    $met = (int) ini_get('max_execution_time');
+    if (in_array('set_time_limit', $disabled, true) && $met > 0 && $met < 120) {
+        list($w, $cm) = fm_setup_ini_fix($p, array('max_execution_time' => '300'));
+        $add($g, 'Time limit', 'warn', $met . ' s (set_time_limit disabled)', 'Zipping, copying or searching big folders stops after ' . $met . ' seconds.', $w, $cm);
+    } else {
+        $add($g, 'Time limit', 'ok', $met ? $met . ' s' : 'none', in_array('set_time_limit', $disabled, true) ? 'Long tasks have enough time.' : 'Long tasks raise their own limit.');
+    }
+    $sp = preg_replace('/^.*;/', '', (string) ini_get('session.save_path')) ?: sys_get_temp_dir();
+    if (ini_get('session.save_handler') === 'files' && !@is_writable($sp)) {
+        $add($g, 'Session folder', 'fail', $sp, 'Sign-ins can\'t be stored, so signing in fails or loops.', 'Let the PHP user (<code>' . fm_enc($p['user']) . '</code>) write to it:', array(array('Fix', 'sudo chown ' . $p['user'] . ' ' . escapeshellarg($sp))));
+    } else {
+        $add($g, 'Session folder', 'ok', ini_get('session.save_handler') . ($sp ? ': ' . $sp : ''), 'Sign-ins are stored.');
+    }
+    $ob = (string) ini_get('open_basedir');
+    if ($ob !== '') {
+        $inside = false;
+        foreach (explode(PATH_SEPARATOR, $ob) as $dir) if ($dir !== '' && strpos(rtrim(FM_ROOT_PATH, '/') . '/', rtrim($dir, '/') . '/') === 0) $inside = true;
+        list($w, $cm) = fm_setup_ini_fix($p, array('open_basedir' => 'none'));
+        $add($g, 'open_basedir', $inside ? 'warn' : 'fail', $ob, ($inside ? 'PHP may only open files inside these folders. ' : 'The root folder (' . FM_ROOT_PATH . ') is outside these folders, so it can\'t be opened. ') . 'The Environment page and the self-update also need files outside them.', 'Remove the restriction for this app\'s pool (or add the root folder to the list):', $cm);
+    } else {
+        $add($g, 'open_basedir', 'ok', 'not set', 'PHP can open every folder the user may read.');
+    }
+    $uses = array('set_time_limit' => 'long tasks', 'curl_exec' => 'upload from URL and updates', 'curl_init' => 'upload from URL and updates', 'symlink' => 'copying links',
+        'readlink' => 'showing link targets', 'chmod' => 'the Permissions dialog', 'chown' => 'keeping owners on update', 'touch' => 'keeping file dates on copy',
+        'disk_free_space' => 'free space', 'ini_set' => 'error settings', 'escapeshellarg' => 'the Environment page', 'opcache_invalidate' => 'settings and updates taking effect at once',
+        'posix_getpwuid' => 'owner names', 'fpm_get_status' => 'finding this pool in Setup check');
+    $hit = array();
+    foreach ($uses as $fn => $what) if (in_array($fn, $disabled, true)) $hit[$what][] = $fn;
+    if ($hit) {
+        $txt = array();
+        foreach ($hit as $what => $fns) $txt[] = implode(', ', $fns) . ' (' . $what . ')';
+        list($src, $line, $kind) = fm_setup_disable_source($p);
+        $add($g, 'Disabled functions', 'warn', count(array_merge(...array_values($hit))) . ' used by the app', 'These are in disable_functions: ' . implode('; ', $txt) . '.', 'Remove them from the <code>disable_functions</code> line' . ($src !== '' ? ' in <code>' . fm_enc($src) . '</code>' : '') . ', then restart PHP. Keep the others.', array(array('Current line', $line), array('Then restart PHP', $restart)));
+    } else {
+        $add($g, 'Disabled functions', 'ok', $disabled ? count($disabled) . ' disabled, none the app needs' : 'none', 'Every function the file manager uses is available.');
+    }
+    if (ini_get('opcache.enable') && !ini_get('opcache.validate_timestamps')) {
+        $add($g, 'OPcache file checks', 'info', 'validate_timestamps = 0', 'The app refreshes its own files after Settings and updates, but files you change by hand only take effect after a PHP restart.', '', array(array('After editing by hand', $restart)));
+    }
+
+    // ---- Files and folders
+    $g = 'Files and folders';
+    $sdir = dirname($GLOBALS['settings_file']);
+    $sok = @is_writable($sdir) && (!@file_exists($GLOBALS['settings_file']) || @is_writable($GLOBALS['settings_file']));
+    $add($g, 'Settings file', $sok ? 'ok' : 'fail', $GLOBALS['settings_file'], $sok ? 'Settings, users and passwords can be saved.' : 'Settings, users and password changes can\'t be saved.',
+        $sok ? '' : 'Let the PHP user (<code>' . fm_enc($p['user']) . '</code>) write the folder and the file:', $sok ? array() : array(array('Fix', 'sudo chown ' . $p['user'] . ' ' . escapeshellarg($sdir) . (@file_exists($GLOBALS['settings_file']) ? ' ' . escapeshellarg($GLOBALS['settings_file']) : ''))));
+    if (@is_file($GLOBALS['settings_file']) && (@fileperms($GLOBALS['settings_file']) & 0044)) {
+        $add($g, 'Settings file privacy', 'warn', sprintf('%04o', @fileperms($GLOBALS['settings_file']) & 0777), 'settings.php holds the password hashes of every user, and other accounts on this server can read it.', 'Make it readable by its owner only:', array(array('Fix', 'sudo chmod 600 ' . escapeshellarg($GLOBALS['settings_file']))));
+    }
+    $self_ok = @is_writable(__FILE__) && @is_writable(dirname(__FILE__));
+    $add($g, 'Self-update', $self_ok ? 'ok' : 'info', basename(__FILE__) . ' in ' . dirname(__FILE__), $self_ok ? 'Updates can be installed from the account menu.' : 'Updates must be installed by hand (PHP may not replace ' . basename(__FILE__) . '). That is also a safe choice.',
+        $self_ok ? '' : 'Only if you want one-click updates:', $self_ok ? array() : array(array('Allow', 'sudo chown ' . $p['user'] . ' ' . escapeshellarg(dirname(__FILE__)) . ' ' . escapeshellarg(__FILE__))));
+    $tmp = sys_get_temp_dir();
+    $utmp = (string) ini_get('upload_tmp_dir') ?: $tmp;
+    $tok = @is_writable($tmp) && @is_writable($utmp);
+    $add($g, 'Temporary folder', $tok ? 'ok' : 'fail', $utmp === $tmp ? $tmp : $tmp . ' · uploads ' . $utmp, $tok ? 'Uploads and zip downloads have room to work.' : 'Uploads and zip downloads need a writable temporary folder.',
+        $tok ? '' : 'Let the PHP user write it (or set upload_tmp_dir / sys_temp_dir to a writable folder):', $tok ? array() : array(array('Fix', 'sudo chmod 1777 ' . escapeshellarg(@is_writable($tmp) ? $utmp : $tmp))));
+    $rr = @is_readable(FM_ROOT_PATH) && @is_dir(FM_ROOT_PATH);
+    $rw = $rr && @is_writable(FM_ROOT_PATH);
+    $add($g, 'Root folder', $rr ? ($rw ? 'ok' : 'warn') : 'fail', FM_ROOT_PATH, $rr ? ($rw ? 'Files can be listed and changed.' : 'Files can be listed, but nothing can be created in the root folder itself.') : 'The root folder can\'t be opened.',
+        $rw ? '' : 'Give the PHP user (<code>' . fm_enc($p['user']) . '</code>) access, or pick another root folder in Settings › Files.', $rw || FM_ROOT_PATH === '/' ? array() : array(array('Fix', 'sudo chown ' . $p['user'] . ' ' . escapeshellarg(FM_ROOT_PATH))));
+
+    // ---- Web server
+    $g = 'Web server';
+    $host = preg_replace('/:\d+$/', '', preg_replace('/[^A-Za-z0-9.:\[\]-]/', '', isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : ''));
+    $https = (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off') || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https');
+    $local = (bool) preg_match('/^(localhost|127\.|\[?::1\]?$)/', $host);
+    $nginx = stripos($p['web'], 'nginx') !== false;
+    $apache = stripos($p['web'], 'apache') !== false;
+    if ($https || $local) {
+        $add($g, 'HTTPS', 'ok', $https ? 'on' : 'local address (' . $host . ')', $https ? 'Passwords and files travel encrypted.' : 'Reached through this machine (e.g. an SSH tunnel), so nothing crosses the network unencrypted.');
+    } else {
+        $cb = array('debian' => 'certbot python3-certbot-' . ($apache ? 'apache' : 'nginx'), 'rhel' => 'certbot python3-certbot-' . ($apache ? 'apache' : 'nginx'), 'alpine' => 'certbot certbot-' . ($apache ? 'apache' : 'nginx'));
+        $add($g, 'HTTPS', 'warn', 'plain http · ' . $host, 'Passwords and files cross the network unencrypted.', 'Get a free certificate from Let\'s Encrypt (the host name must point to this server):',
+            ($nginx || $apache) ? array(array('Install certbot', fm_setup_os_pkg($p, $cb)), array('Get the certificate', 'sudo certbot --' . ($apache ? 'apache' : 'nginx') . ' -d ' . $host)) : array());
+    }
+    $nb = $nginx ? fm_setup_nginx_body() : array();
+    $fix = $nginx ? 'Raise <code>client_max_body_size</code> in the <code>server</code> block of this site (or the <code>http</code> block of nginx.conf), then reload nginx:' : ($apache ? 'Raise <code>LimitRequestBody</code> for this site, then reload Apache:' : 'Raise the request body limit of your web server or proxy (e.g. Cloudflare\'s free plan stops at 100 MB).');
+    $cm = $nginx ? array(array('Line', 'client_max_body_size ' . $want_txt . ';'), array('Then', 'sudo nginx -t && sudo ' . ($p['systemd'] ? 'systemctl reload nginx' : 'rc-service nginx reload'))) : ($apache ? array(array('Line', 'LimitRequestBody ' . $want), array('Then', 'sudo apachectl configtest && sudo ' . ($p['systemd'] ? 'systemctl reload ' . ($p['family'] === 'rhel' ? 'httpd' : 'apache2') : 'rc-service apache2 reload'))) : array());
+    $c[] = array('group' => $g, 'title' => 'Upload piece reaches PHP', 'status' => 'info', 'value' => 'not tested yet', 'probe' => $chunk,
+        'why' => 'Sends one test upload of ' . fm_env_bytes($chunk) . ' (the piece size) to check the web server and any proxy let it through.' . ($nb ? ' nginx has: ' . implode(', ', $nb) . '.' : ''),
+        'fix' => $fix, 'cmds' => $cm);
+    $add($g, 'Web server', 'info', $p['web'] ?: 'unknown', 'Detected from the request.' . ($p['sapi'] === 'fpm-fcgi' ? ' PHP runs as FPM pool ' . ($p['pool'] ?: '?') . ($p['service'] ? ', service ' . $p['service'] : '') . '.' : ''));
+
+    // ---- Environment page
+    $g = 'Environment page';
+    $shell = fm_env_shell_ok();
+    $tools_on = !empty($GLOBALS['server_tools']);
+    if (!$tools_on) {
+        $add($g, 'Server tools', 'info', 'off', 'The Environment page (system, services, logs, cron jobs) is switched off. It is meant for servers where every full-access user may see the system.', 'Switch it on in Settings › Access › Server tools.');
+    } else {
+        $add($g, 'Server tools', 'ok', 'on', 'The Environment page is available to administrators.');
+    }
+    if ($shell) {
+        $add($g, 'shell_exec', 'ok', 'available', 'The Environment page can run its fixed, read-only commands.');
+    } else {
+        list($src, $line, $kind) = fm_setup_disable_source($p);
+        $new = implode(',', array_diff($disabled, array('shell_exec')));
+        $why = 'shell_exec is in disable_functions, so the Environment page shows a Limited view: versions, disks, processes and ports come from files, but services, containers, the firewall, fail2ban, logins, timers and the system journal can\'t be read. '
+            . 'Trade-off: the page only runs fixed commands, never built from what a browser sends, but allowing shell_exec widens what any PHP bug in this pool could do. With a root pool that can already write every file the extra risk is small; with an unprivileged pool, keeping it off is a fair choice.';
+        if ($kind === 'pool') {
+            $fix = 'Change the line in <code>' . fm_enc($src) . '</code> (this pool only), then restart PHP:';
+            $cm = array(array('Current line', $line), array('New line', preg_replace('/=.*$/', '= ' . $new, $line)), array('Then restart PHP', $restart));
+        } elseif ($kind === 'ini') {
+            $fix = 'It is set in <code>' . fm_enc($src) . '</code>, which applies to every pool of this PHP. A pool can only add to that list, not remove from it, so the change has to go there:';
+            $cm = array(array('Current line', $line), array('New line', 'disable_functions = ' . $new), array('Then restart PHP', $restart));
+        } else {
+            $fix = 'Remove <code>shell_exec</code> from <code>disable_functions</code> where PHP is started for this app, then restart it.';
+            $cm = array();
+        }
+        $add($g, 'shell_exec', $tools_on ? 'warn' : 'info', 'disabled', $why, $fix, $cm);
+    }
+    $mounts = (string) @file_get_contents('/proc/self/mounts');
+    if (preg_match('/^proc \/proc proc (\S+)/m', $mounts, $m) && preg_match('/hidepid=(\d|invisible|noaccess)/', $m[1], $hp) && $hp[1] !== '0') {
+        $add($g, '/proc visibility', 'info', 'hidepid=' . $hp[1], 'Processes of other users are hidden, so Processes and the program names of ports are incomplete.');
+    } else {
+        $add($g, '/proc visibility', @is_readable('/proc/1/stat') ? 'ok' : 'info', @is_readable('/proc/1/stat') ? 'readable' : 'restricted', @is_readable('/proc/1/stat') ? 'Processes, ports and memory can be read.' : 'Processes and ports may be incomplete.');
+    }
+    if ($p['family'] === 'debian') {
+        $add($g, 'Package list', @is_readable('/var/lib/dpkg/status') ? 'ok' : 'info', '/var/lib/dpkg/status', @is_readable('/var/lib/dpkg/status') ? 'Software versions can be read even without shell_exec.' : 'Software versions need shell_exec.');
+    }
+    if ($tools_on && $shell) {
+        foreach (array(
+            array('timeout', 'warn', 'Every Environment command (time limit)', array('debian' => 'coreutils', 'rhel' => 'coreutils', 'alpine' => 'coreutils')),
+            array('ps', 'warn', 'Processes', array('debian' => 'procps', 'rhel' => 'procps-ng', 'alpine' => 'procps')),
+            array('ss', 'warn', 'Listening ports', array('debian' => 'iproute2', 'rhel' => 'iproute', 'alpine' => 'iproute2')),
+            array('ip', 'warn', 'Network interfaces', array('debian' => 'iproute2', 'rhel' => 'iproute', 'alpine' => 'iproute2')),
+            array('df', 'warn', 'Disks', array('debian' => 'coreutils', 'rhel' => 'coreutils', 'alpine' => 'coreutils')),
+            array('lsblk', 'info', 'Block devices', array('debian' => 'util-linux', 'rhel' => 'util-linux', 'alpine' => 'lsblk')),
+            array('systemctl', 'info', 'Services and timers (systemd)', array()),
+            array('journalctl', 'info', 'System journal in Logs (systemd)', array()),
+            array('ufw', 'info', 'Firewall status (optional)', array('debian' => 'ufw', 'alpine' => 'ufw')),
+            array('fail2ban-client', 'info', 'fail2ban status (optional)', array('debian' => 'fail2ban', 'rhel' => 'fail2ban', 'alpine' => 'fail2ban')),
+            array('docker', 'info', 'Containers (only if you use Docker)', array()),
+        ) as $t) {
+            if (fm_env_has($t[0])) {
+                $add($g, 'Tool ' . $t[0], 'ok', 'installed', $t[2] . '.');
+            } else {
+                $cmd = fm_setup_os_pkg($p, $t[3]);
+                $add($g, 'Tool ' . $t[0], $t[1], 'not found', $t[2] . ' can\'t be shown.', $cmd !== '' ? 'Install it:' : ($t[0] === 'systemctl' || $t[0] === 'journalctl' ? 'This server doesn\'t use systemd; that part stays empty.' : ''), array(array('Install', $cmd)));
+            }
+        }
+        if ($p['family'] === 'debian') {
+            $ok = is_executable('/usr/lib/update-notifier/apt-check');
+            $add($g, 'Tool apt-check', $ok ? 'ok' : 'info', $ok ? 'installed' : 'not found', 'Pending and security updates on the Security tab.', $ok ? '' : 'Install it:', $ok ? array() : array(array('Install', 'sudo apt install -y update-notifier-common'))); // Ubuntu
+        }
+    }
+
+    // ---- Access
+    $g = 'Access';
+    if (!FM_USE_AUTH) $add($g, 'Sign-in', 'fail', 'off', 'Anyone who can open this page has full access to the files.', 'Switch on Settings › Access › Require sign-in.');
+    else $add($g, 'Sign-in', 'ok', 'required', 'Only signed-in users get in.');
+    if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
+        $add($g, 'PHP runs as root', 'info', $p['user'], 'This app can read and change every file on the server, and the Environment page sees everything. Fine for an administrators-only tool behind a tunnel or VPN; for anything else, run its pool as an ordinary user.');
+    } else {
+        $add($g, 'PHP user', 'ok', $p['user'], 'The app can only reach what this user may.' . ($tools_on ? ' Some Environment details (other users\' logs and crontabs) may stay hidden.' : ''));
+    }
+    return $c;
+}
+
+/** The checks as HTML: groups of rows; rows that need something open to the fix and its commands */
+function fm_setup_render($checks, $compact = false)
+{
+    $icon = array('ok' => 'fa-check-circle', 'fail' => 'fa-times-circle', 'warn' => 'fa-exclamation-triangle', 'info' => 'fa-info-circle');
+    $label = array('ok' => 'OK', 'fail' => 'Fix needed', 'warn' => 'Limited', 'info' => 'Note');
+    $gicon = array('PHP' => 'fa-code', 'PHP settings' => 'fa-sliders', 'Files and folders' => 'fa-folder-open-o', 'Web server' => 'fa-globe', 'Environment page' => 'fa-server', 'Access' => 'fa-lock');
+    $groups = array();
+    foreach ($checks as $c) $groups[$c['group']][] = $c;
+    $h = '<div class="fm-setup' . ($compact ? ' is-compact' : '') . '">';
+    foreach ($groups as $name => $items) {
+        $n = array('fail' => 0, 'warn' => 0, 'info' => 0, 'ok' => 0);
+        foreach ($items as $c) $n[$c['status']]++;
+        $h .= '<section class="fm-setup-group"><h3><i class="fa ' . (isset($gicon[$name]) ? $gicon[$name] : 'fa-circle') . '" aria-hidden="true"></i> ' . fm_enc($name)
+            . ($n['fail'] ? ' <span class="fm-env-badge is-bad">' . $n['fail'] . ' to fix</span>' : '') . ($n['warn'] ? ' <span class="fm-env-badge is-warn">' . $n['warn'] . ' limited</span>' : '')
+            . (!$n['fail'] && !$n['warn'] ? ' <span class="fm-env-badge is-ok">OK</span>' : '') . ($n['ok'] ? ' <span class="fm-setup-pass">' . $n['ok'] . ' passing</span>' : '') . '</h3>';
+        foreach ($items as $c) {
+            $st = $c['status'];
+            $probe = isset($c['probe']) ? ' data-probe="' . (int) $c['probe'] . '"' : '';
+            $body = !empty($c['fix']) || !empty($c['cmds']) || $probe;
+            $head = '<i class="fa ' . $icon[$st] . ' fm-setup-st" aria-hidden="true"></i><span class="fm-setup-title">' . fm_enc($c['title']) . '</span>'
+                . '<span class="fm-setup-val" title="' . fm_enc($c['value']) . '">' . fm_enc($c['value']) . '</span><span class="fm-env-badge fm-setup-badge is-' . ($st === 'fail' ? 'bad' : ($st === 'ok' ? 'ok' : ($st === 'warn' ? 'warn' : 'note'))) . '">' . $label[$st] . '</span>';
+            if (!$body) {
+                $h .= '<div class="fm-setup-item is-' . $st . '" data-status="' . $st . '"><div class="fm-setup-row">' . $head . '<i class="fa fa-fw" aria-hidden="true"></i></div><p class="fm-setup-why">' . fm_enc($c['why']) . '</p></div>';
+                continue;
+            }
+            $h .= '<details class="fm-setup-item is-' . $st . '" data-status="' . $st . '"' . $probe . ($st === 'fail' ? ' open' : '') . '><summary class="fm-setup-row">' . $head . '<i class="fa fa-angle-down fm-setup-chev" aria-hidden="true"></i></summary>'
+                . '<p class="fm-setup-why">' . fm_enc($c['why']) . '</p><div class="fm-setup-body">';
+            if ($probe) $h .= '<p class="fm-setup-probe"><button type="button" class="btn btn-outline-secondary btn-sm fm-setup-run"><i class="fa fa-play" aria-hidden="true"></i> Run the test</button> <span class="fm-setup-probe-out" role="status"></span></p>';
+            if (!empty($c['fix'])) $h .= '<p class="fm-setup-fix">' . $c['fix'] . '</p>';
+            foreach ($c['cmds'] as $cmd) {
+                $h .= '<div class="fm-setup-cmd"><span>' . fm_enc($cmd[0]) . '</span><pre><code>' . fm_enc($cmd[1]) . '</code></pre><button type="button" class="fm-user-btn fm-setup-copy" title="Copy" aria-label="Copy"><i class="fa fa-clipboard" aria-hidden="true"></i></button></div>';
+            }
+            $h .= '</div></details>';
+        }
+        $h .= '</section>';
+    }
+    return $h . '</div>';
+}
+
+/** Counts for the summary chips */
+function fm_setup_counts($checks)
+{
+    $n = array('fail' => 0, 'warn' => 0, 'info' => 0, 'ok' => 0);
+    foreach ($checks as $c) $n[$c['status']]++;
+    return $n;
+}
+
+/** The page script: copy buttons, "Copy all fixes", "Show passing", the upload test (vanilla JS: jQuery loads after the page) */
+function fm_setup_script()
+{
+    static $done = false;
+    if ($done) return '';
+    $done = true;
+    return <<<'JS'
+<script>
+(function() {
+    function copy(text, done) {
+        var ok = function() { if (typeof toast === 'function') toast(done || 'Copied'); };
+        if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(text).then(ok, function() { fallback(); }); return; }
+        fallback();
+        function fallback() {
+            var t = document.createElement('textarea');
+            t.value = text; t.setAttribute('readonly', ''); t.style.position = 'fixed'; t.style.opacity = '0';
+            document.body.appendChild(t); t.select();
+            try { document.execCommand('copy'); ok(); } catch (e) {}
+            t.remove();
+        }
+    }
+    document.addEventListener('click', function(e) {
+        var b = e.target.closest('.fm-setup-copy');
+        if (b) { copy(b.parentNode.querySelector('code').textContent, 'Command copied'); return; }
+        var all = e.target.closest('[data-setup-copyall]');
+        if (all) {
+            var out = [];
+            document.querySelectorAll('.fm-setup-item[data-status="fail"], .fm-setup-item[data-status="warn"]').forEach(function(it) {
+                var cmds = it.querySelectorAll('.fm-setup-cmd');
+                if (!cmds.length) return;
+                out.push('# ' + it.querySelector('.fm-setup-title').textContent + ': ' + it.querySelector('.fm-setup-val').textContent);
+                cmds.forEach(function(c) { out.push(c.querySelector('code').textContent); });
+                out.push('');
+            });
+            copy(out.length ? out.join('\n') : '# Nothing to fix', out.length ? 'Fix commands copied' : 'Nothing to fix');
+            return;
+        }
+        var run = e.target.closest('.fm-setup-run');
+        if (run) probe(run.closest('.fm-setup-item'));
+    });
+    document.addEventListener('change', function(e) {
+        if (e.target.matches('[data-setup-passing]')) document.querySelectorAll('.fm-setup').forEach(function(s) { s.classList.toggle('show-ok', e.target.checked); });
+    });
+    // status rows in the side panel: show only that status (click again for everything)
+    document.addEventListener('click', function(e) {
+        var b = e.target.closest('[data-setup-filter]');
+        if (!b) return;
+        var on = b.getAttribute('aria-pressed') !== 'true', st = b.getAttribute('data-setup-filter');
+        document.querySelectorAll('[data-setup-filter]').forEach(function(x) { x.setAttribute('aria-pressed', x === b && on ? 'true' : 'false'); });
+        document.querySelectorAll('.fm-setup').forEach(function(s) {
+            if (on) s.setAttribute('data-only', st); else s.removeAttribute('data-only');
+            s.querySelectorAll('.fm-setup-group').forEach(function(g) {
+                g.hidden = on && !g.querySelector('.fm-setup-item[data-status="' + st + '"]');
+            });
+        });
+    });
+    // one upload piece of the configured size, sent the way Upload sends it
+    function probe(item) {
+        var out = item.querySelector('.fm-setup-probe-out'), size = parseInt(item.getAttribute('data-probe'), 10) || 1048576;
+        var set = function(st, val, msg) {
+            item.setAttribute('data-status', st);
+            item.className = item.className.replace(/\bis-(ok|fail|warn|info)\b/, 'is-' + st);
+            item.querySelector('.fm-setup-st').className = 'fa fm-setup-st ' + ({ok: 'fa-check-circle', fail: 'fa-times-circle', warn: 'fa-exclamation-triangle', info: 'fa-info-circle'})[st];
+            var badge = item.querySelector('.fm-setup-badge');
+            badge.className = 'fm-env-badge fm-setup-badge is-' + ({ok: 'ok', fail: 'bad', warn: 'warn', info: 'note'})[st];
+            badge.textContent = ({ok: 'OK', fail: 'Fix needed', warn: 'Limited', info: 'Note'})[st];
+            item.querySelector('.fm-setup-val').textContent = val;
+            out.innerHTML = msg;
+        };
+        out.innerHTML = '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Sending ' + (size / 1048576).toFixed(1) + ' MB…';
+        var fd = new FormData();
+        fd.append('ajax', 'true');
+        fd.append('type', 'setup_probe');
+        fd.append('token', window.csrf);
+        fd.append('probe', new Blob([new Uint8Array(size)]), 'probe.bin');
+        fetch(location.pathname + '?p=', {method: 'POST', body: fd, credentials: 'same-origin'}).then(function(r) {
+            return r.text().then(function(t) { return {status: r.status, text: t}; });
+        }).then(function(r) {
+            var d = null;
+            try { d = JSON.parse(r.text); } catch (e) {}
+            if (r.status === 413) set('fail', 'refused by the web server (413)', 'The web server or a proxy in front of it refused the piece before PHP saw it. Raise its body limit (below).');
+            else if (d && d.ok) set('ok', 'passed (' + (d.got / 1048576).toFixed(1) + ' MB arrived)', 'A full upload piece reached PHP.');
+            else if (d && d.error) set('fail', 'refused by PHP', d.error);
+            else if (r.status === 401 || r.status === 200) set('fail', 'dropped by PHP (post_max_size)', 'The piece reached PHP but was larger than post_max_size, so PHP dropped it. See "Upload size limits" above.');
+            else set('warn', 'could not test (HTTP ' + r.status + ')', 'The test did not finish. Try again.');
+        }).catch(function() { set('warn', 'could not test', 'The connection broke during the test (often a proxy limit). Try again.'); });
+    }
+})();
+</script>
+JS;
 }
 
 function fm_env_system()
@@ -6122,12 +7932,15 @@ function fm_env_system()
     $up = (float) @file_get_contents('/proc/uptime');
     $load = preg_split('/\s+/', trim((string) @file_get_contents('/proc/loadavg')));
     $tz = fm_env_run('timedatectl show -p Timezone --value', 3);
+    if ($tz === '') $tz = fm_env_tz_file();
+    $ntp = fm_env_run('timedatectl show -p NTPSynchronized --value', 3);
+    if ($ntp === '' && @file_exists('/run/systemd/timesync/synchronized')) $ntp = 'yes'; // otherwise unknown, never "no"
     return array(
         'hostname' => gethostname(),
         'os' => isset($os['PRETTY_NAME']) ? $os['PRETTY_NAME'] : php_uname('s'),
         'kernel' => php_uname('r'),
         'arch' => php_uname('m'),
-        'virt' => fm_env_run('systemd-detect-virt', 3) ?: 'none detected',
+        'virt' => fm_env_run('systemd-detect-virt', 3) ?: (fm_env_virt_file() ?: 'none detected'),
         'cpu' => isset($model[1]) ? trim(preg_replace('/\s+/', ' ', $model[1])) : 'Unknown CPU',
         'threads' => $threads,
         'uptime' => $up,
@@ -6135,7 +7948,7 @@ function fm_env_system()
         'load' => array((float) $load[0], (float) (isset($load[1]) ? $load[1] : 0), (float) (isset($load[2]) ? $load[2] : 0)),
         'tasks' => isset($load[3]) ? $load[3] : '',
         'tz' => $tz !== '' ? $tz : date_default_timezone_get(),
-        'ntp' => fm_env_run('timedatectl show -p NTPSynchronized --value', 3),
+        'ntp' => $ntp,
     );
 }
 
@@ -6176,7 +7989,7 @@ function fm_env_disks()
         $disks[$c[5]]['inodes'] = (float) $c[1];
         $disks[$c[5]]['ipct'] = $c[1] > 0 ? round($c[2] / $c[1] * 100) : null;
     }
-    return array_values($disks);
+    return $disks ? array_values($disks) : fm_env_disks_proc();
 }
 
 function fm_env_blocks()
@@ -6192,13 +8005,15 @@ function fm_env_blocks()
         }
     };
     $walk(isset($j['blockdevices']) ? $j['blockdevices'] : array(), 0);
-    return $out;
+    return $out ? $out : fm_env_blocks_sys();
 }
 
 function fm_env_web()
 {
     // only a real version, never an error message, ends up on the page
     $nginx = preg_match('/nginx\/(\S+)/', fm_env_run('nginx -v', 3, true), $nv) ? $nv[1] : '';
+    // no shell (disable_functions): fall back to the installed package
+    if ($nginx === '') $nginx = fm_env_pkg_version(array('nginx', 'nginx-core', 'nginx-full', 'nginx-light', 'nginx-extras', 'nginx-common'));
     $sites = array();
     foreach ((glob('/etc/nginx/sites-enabled/*') ?: array()) as $f) {
         $txt = (string) @file_get_contents($f);
@@ -6207,16 +8022,7 @@ function fm_env_web()
         foreach ($sn[1] as $n) foreach (preg_split('/\s+/', trim($n)) as $x) if ($x !== '' && $x !== '_' && !in_array($x, $names, true)) $names[] = $x;
         $sites[] = array('file' => basename($f), 'names' => $names, 'https' => (bool) preg_match('/listen\s+[^;]*443/', $txt));
     }
-    $pools = array();
-    foreach ((glob('/etc/php/*/fpm/pool.d/*.conf') ?: array()) as $f) {
-        $txt = (string) @file_get_contents($f);
-        $get = function ($k) use ($txt) {
-            return preg_match('/^\s*' . preg_quote($k, '/') . '\s*=\s*(.+)$/m', $txt, $m) ? trim($m[1]) : '';
-        };
-        preg_match('/^\s*\[([^\]]+)\]/m', $txt, $name);
-        $pools[] = array('version' => basename(dirname(dirname(dirname($f)))), 'name' => isset($name[1]) ? $name[1] : basename($f, '.conf'),
-            'user' => $get('user'), 'listen' => $get('listen'), 'pm' => $get('pm'), 'max' => $get('pm.max_children'));
-    }
+    $pools = fm_env_fpm_pools();
     $opc = function_exists('opcache_get_status') ? @opcache_get_status(false) : false;
     $runtimes = array();
     foreach (array('PostgreSQL' => array('psql', 'psql --version'), 'MySQL / MariaDB' => array('mysql', 'mysql --version'), 'Docker' => array('docker', 'docker --version'),
@@ -6225,6 +8031,14 @@ function fm_env_web()
         if (!fm_env_has($c[0])) continue;
         $v = strtok(fm_env_run($c[1], 4, true), "\n");
         if (preg_match('/(\d+\.\d+(\.\d+)?[\w.+-]*)/', $v, $m)) $runtimes[$label] = $m[1];
+    }
+    if (!fm_env_shell_ok()) {
+        // no shell: read the versions from the package database instead
+        foreach (array('PostgreSQL' => array('postgresql-[0-9]*', 'postgresql-client-[0-9]*'), 'MySQL / MariaDB' => array('mysql-server-core-*', 'mariadb-server-core*', 'mariadb-server'),
+            'Docker' => array('docker-ce', 'docker.io'), 'Java' => array('openjdk-*-jre-headless', 'openjdk-*-jdk-headless'), 'Node.js' => array('nodejs'),
+            'Python' => array('python3.[0-9]*-minimal', 'python3'), 'OpenSSL' => array('openssl'), 'Git' => array('git'), 'Redis' => array('redis-server')) as $label => $names) {
+            if (!isset($runtimes[$label]) && ($v = fm_env_pkg_version($names)) !== '') $runtimes[$label] = $v;
+        }
     }
     // CommandBox / Lucee: the engine the service starts
     if (preg_match('/cfengine=(\S+)/', fm_env_run('systemctl cat commandbox', 3), $m)) $runtimes['CommandBox (Lucee)'] = $m[1];
@@ -6240,7 +8054,7 @@ function fm_env_web()
         'nginx' => $nginx ?: '', 'server_software' => isset($_SERVER['SERVER_SOFTWARE']) ? $_SERVER['SERVER_SOFTWARE'] : '',
         'sites' => $sites, 'php' => PHP_VERSION, 'sapi' => php_sapi_name(), 'php_ini' => php_ini_loaded_file() ?: 'none',
         'php_versions' => array_map('basename', glob('/etc/php/*', GLOB_ONLYDIR) ?: array()), 'pools' => $pools,
-        'run_as' => function_exists('posix_getpwuid') ? posix_getpwuid(posix_geteuid())['name'] : get_current_user(),
+        'run_as' => function_exists('posix_getpwuid') && function_exists('posix_geteuid') && ($pw = @posix_getpwuid(posix_geteuid())) ? $pw['name'] : get_current_user(),
         'opcache' => $opc, 'runtimes' => $runtimes, 'ini' => $ini, 'extensions' => array_values($exts),
     );
 }
@@ -6294,10 +8108,12 @@ function fm_env_network()
         if (!preg_match('/^(.*):(\d+|\*)$/', $c[4], $lp)) continue;
         $addr = trim($lp[1], '[]');
         $proc = preg_match('/users:\(\("([^"]+)",pid=(\d+)/', isset($c[6]) ? $c[6] : '', $pm) ? $pm[1] : '';
-        $public = !preg_match('/^(127\.|::1$|localhost)/', preg_replace('/%.*$/', '', $addr));
+        $public = !preg_match('/^(127\.|::1$|::ffff:127\.|localhost)/', preg_replace('/%.*$/', '', $addr));
         $k = $c[0] . $lp[2] . $addr;
         $ports[$k] = array('proto' => $c[0], 'port' => $lp[2], 'addr' => $addr, 'proc' => $proc, 'public' => $public);
     }
+    if (!$ifs) list($ifs, $veth) = fm_env_ifs_proc();
+    if (!$ports) $ports = fm_env_ports_proc();
     usort($ports, function ($a, $b) {
         return array(!$a['public'], (int) $a['port']) <=> array(!$b['public'], (int) $b['port']);
     });
@@ -6316,7 +8132,9 @@ function fm_env_processes()
         }
         return $out;
     };
-    return array('cpu' => $read('-pcpu'), 'mem' => $read('-rss'), 'count' => (int) fm_env_run('sh -c "ps -e --no-headers | wc -l"', 3));
+    if (!fm_env_shell_ok()) return fm_env_processes_proc();
+    $r = array('cpu' => $read('-pcpu'), 'mem' => $read('-rss'), 'count' => (int) fm_env_run('sh -c "ps -e --no-headers | wc -l"', 3));
+    return $r['count'] ? $r : fm_env_processes_proc();
 }
 
 /** The slow checks, loaded in the background: firewall, fail2ban, updates, reboot, logins, SSH */
@@ -6345,6 +8163,14 @@ function fm_env_security()
     if (is_executable('/usr/lib/update-notifier/apt-check') && preg_match('/^(\d+);(\d+)$/m', fm_env_run('/usr/lib/update-notifier/apt-check', 20, true), $m)) {
         $updates = array('all' => (int) $m[1], 'security' => (int) $m[2]);
     }
+    if ($updates === null && is_readable('/var/lib/update-notifier/updates-available')) {
+        // written by update-notifier (Ubuntu login message); may be a few hours old
+        $t = (string) @file_get_contents('/var/lib/update-notifier/updates-available');
+        if (preg_match('/(\d+) updates? can be applied immediately/', $t, $m)) {
+            $updates = array('all' => (int) $m[1], 'security' => preg_match('/(\d+) of these updates? (?:is a|are) (?:standard )?security updates?/', $t, $x) ? (int) $x[1] : 0,
+                'asof' => (int) @filemtime('/var/lib/update-notifier/updates-available'));
+        }
+    }
     $reboot = is_file('/var/run/reboot-required');
     $reboot_pkgs = $reboot ? array_filter(array_map('trim', (array) @file('/var/run/reboot-required.pkgs'))) : array();
     $logins = array();
@@ -6356,6 +8182,7 @@ function fm_env_security()
     foreach (explode("\n", fm_env_run('sshd -T', 4)) as $l) {
         if (preg_match('/^(port|permitrootlogin|passwordauthentication|pubkeyauthentication|maxauthtries|x11forwarding)\s+(.+)$/', $l, $m)) $ssh[$m[1]] = $m[2];
     }
+    if (!$ssh) $ssh = fm_env_sshd_file();
     $failed_ssh = 0;
     $since = '';
     if (is_readable('/var/log/auth.log')) {
@@ -6394,7 +8221,7 @@ function fm_env_log_catalog()
             $add($group, $labeller ? $labeller($f) : $f, 'file', $f);
         }
     };
-    if (fm_env_has('journalctl')) {
+    if (fm_env_shell_ok() && fm_env_has('journalctl')) {
         $add('System journal', 'Everything (all services)', 'journal', '');
         $svc = fm_env_services();
         foreach ($svc['all'] as $s) {
@@ -6941,12 +8768,15 @@ function fm_env_security_html()
 {
     $s = fm_env_security();
     $alerts = array();
+    $noshell = !fm_env_shell_ok();
+    $na = '<span class="fm-env-badge" title="Needs shell_exec (disabled for this PHP pool)">needs shell_exec</span>';
     $h = '<div class="fm-env-grid2">';
     // updates + reboot
     $h .= '<section class="fm-env-box"><h3><i class="fa fa-refresh" aria-hidden="true"></i> Updates</h3>';
     if ($s['updates'] === null) {
-        $h .= '<p class="fm-env-muted">Could not ask the package manager.</p>';
+        $h .= '<p class="fm-env-muted">' . ($noshell ? 'Needs shell_exec (disabled for this PHP pool), or update-notifier\'s status file.' : 'Could not ask the package manager.') . '</p>';
     } else {
+        if (!empty($s['updates']['asof'])) $h .= '<p class="fm-env-muted">From update-notifier, as of ' . date('Y-m-d H:i', $s['updates']['asof']) . '.</p>';
         $h .= '<dl class="fm-env-kv"><dt>Pending updates</dt><dd>' . $s['updates']['all'] . '</dd><dt>Security updates</dt><dd>' . ($s['updates']['security'] ? fm_env_badge($s['updates']['security'] . ' pending', 'is-bad') : fm_env_badge('None', 'is-ok')) . '</dd>';
         $h .= '<dt>Reboot needed</dt><dd>' . ($s['reboot'] ? fm_env_badge('Yes', 'is-warn') . ($s['reboot_pkgs'] ? ' <span class="fm-env-muted">for ' . fm_env_e(implode(', ', array_slice($s['reboot_pkgs'], 0, 6))) . '</span>' : '') : fm_env_badge('No', 'is-ok')) . '</dd></dl>';
         if ($s['updates']['security']) $alerts[] = array('bad', $s['updates']['security'] . ' security update' . ($s['updates']['security'] > 1 ? 's' : '') . ' pending', 'security');
@@ -6965,7 +8795,7 @@ function fm_env_security_html()
     $h .= '<dt>Failed login attempts</dt><dd>' . number_format($s['failed_ssh']) . ($s['since'] ? ' <span class="fm-env-muted">since ' . date('Y-m-d', $s['since']) . ' (auth.log)</span>' : '') . '</dd></dl></section>';
     $h .= '</div>';
     // firewall
-    $h .= '<section class="fm-env-box"><h3><i class="fa fa-shield" aria-hidden="true"></i> Firewall (ufw) ' . ($s['ufw']['active'] === null ? fm_env_badge('Not installed') : ($s['ufw']['active'] ? fm_env_badge('Active', 'is-ok') : fm_env_badge('Inactive', 'is-bad'))) . '</h3>';
+    $h .= '<section class="fm-env-box"><h3><i class="fa fa-shield" aria-hidden="true"></i> Firewall (ufw) ' . ($noshell ? $na : '') . ($noshell ? '' : ($s['ufw']['active'] === null ? fm_env_badge('Not installed') : ($s['ufw']['active'] ? fm_env_badge('Active', 'is-ok') : fm_env_badge('Inactive', 'is-bad')))) . '</h3>';
     if ($s['ufw']['active'] === false) $alerts[] = array('bad', 'The firewall (ufw) is not active', 'security');
     if ($s['ufw']['defaults']) $h .= '<p class="fm-env-muted">Defaults: ' . fm_env_e($s['ufw']['defaults']) . '</p>';
     if ($s['ufw']['rules']) {
@@ -6977,7 +8807,7 @@ function fm_env_security_html()
     // fail2ban
     $banned = 0;
     foreach ($s['jails'] as $j) $banned += $j['banned'];
-    $h .= '<section class="fm-env-box"><h3><i class="fa fa-ban" aria-hidden="true"></i> fail2ban ' . ($s['jails'] ? fm_env_badge($banned . ' banned now', $banned ? 'is-warn' : 'is-ok') : fm_env_badge('Not running')) . '</h3>';
+    $h .= '<section class="fm-env-box"><h3><i class="fa fa-ban" aria-hidden="true"></i> fail2ban ' . ($noshell ? $na : ($s['jails'] ? fm_env_badge($banned . ' banned now', $banned ? 'is-warn' : 'is-ok') : fm_env_badge('Not running'))) . '</h3>';
     if ($s['jails']) {
         $h .= '<div class="fm-env-tablewrap"><table class="fm-env-table"><thead><tr><th>Jail</th><th class="is-num">Banned now</th><th class="is-num">Banned in total</th><th class="is-num">Failing now</th></tr></thead><tbody>';
         foreach ($s['jails'] as $j) $h .= '<tr><td>' . fm_env_e($j['name']) . '</td><td class="is-num">' . $j['banned'] . '</td><td class="is-num">' . number_format($j['total']) . '</td><td class="is-num">' . $j['failed'] . '</td></tr>';
@@ -6991,10 +8821,10 @@ function fm_env_security_html()
         foreach ($s['logins'] as $l) $h .= '<tr><td>' . fm_env_e($l['user']) . '</td><td class="is-mono">' . fm_env_e($l['from']) . '</td><td>' . fm_env_e($l['when']) . '</td><td>' . (strpos($l['state'], 'still') !== false ? fm_env_badge('Still logged in', 'is-ok') : fm_env_e($l['state'])) . '</td></tr>';
         $h .= '</tbody></table></div>';
     } else {
-        $h .= '<p class="fm-env-muted">No logins recorded.</p>';
+        $h .= '<p class="fm-env-muted">' . ($noshell ? 'Needs shell_exec (disabled for this PHP pool).' : 'No logins recorded.') . '</p>';
     }
     $h .= '</section>';
-    return array('html' => $h, 'alerts' => $alerts, 'banned' => $banned, 'updates' => $s['updates'], 'reboot' => $s['reboot']);
+    return array('html' => $h, 'alerts' => $alerts, 'banned' => $banned, 'updates' => $s['updates'], 'reboot' => $s['reboot'], 'noshell' => $noshell);
 }
 
 /** The Scheduled jobs tab body */
@@ -7023,6 +8853,7 @@ function fm_env_jobs_html()
     $h .= '</tbody></table></div></section>';
     $h .= '<section class="fm-env-box"><h3><i class="fa fa-cogs" aria-hidden="true"></i> systemd timers <span class="fm-env-muted">' . count($timers) . '</span></h3>';
     $h .= '<div class="fm-env-tablewrap is-tall"><table class="fm-env-table"><thead><tr><th>Timer</th><th>Last run</th><th>Result</th><th>Next run</th><th>State</th><th></th></tr></thead><tbody>';
+    if (!$timers && !fm_env_shell_ok()) $h .= '<tr><td colspan="6" class="fm-env-muted">Needs shell_exec (disabled for this PHP pool).</td></tr>';
     foreach ($timers as $t) {
         $res = $t['running'] ? fm_env_badge('Running', 'is-ok') : ($t['result'] === 'success' ? fm_env_badge('Success', 'is-ok') : ($t['result'] ? fm_env_badge($t['result'] . ($t['status'] !== '' && $t['status'] !== '0' ? ' (exit ' . $t['status'] . ')' : ''), 'is-bad') : '—'));
         if ($t['result'] && $t['result'] !== 'success' && !$t['running']) $alerts['t' . $t['unit']] = array('bad', 'Timer ' . $t['unit'] . ' last ended with "' . $t['result'] . '"', 'jobs');
@@ -7267,6 +9098,7 @@ function fm_settings_schema()
         )),
         'advanced' => array('Advanced', 'fa-wrench', 'Only needed when the defaults don\'t match how the server is set up.', array(
             'root_url' => array('type' => 'text', 'label' => 'Root folder web address', 'desc' => 'Web path of the root folder for "open in browser" links. Empty = site root.', 'max' => 300, 'placeholder' => 'Site root'),
+            'update_check' => array('type' => 'bool', 'label' => 'Check for updates daily', 'desc' => 'Asks GitHub once a day whether a newer version exists; admins see a dot on the account menu.'),
             'http_host' => array('type' => 'text', 'label' => 'Host name', 'desc' => 'Host used in links the app builds. Empty detects it from each request.', 'max' => 255, 'placeholder' => 'Detected automatically'),
         )),
     );
@@ -7546,7 +9378,17 @@ function fm_settings_snapshot()
 function fm_settings_read()
 {
     global $settings_file;
-    $data = is_readable($settings_file) ? @include($settings_file) : null;
+    $data = null;
+    if (is_file($settings_file) && !is_readable($settings_file)) {
+        fm_errlog('config', 'settings.php exists but PHP may not read it, so the built-in defaults are used', $settings_file, 'error', 86400);
+    } elseif (is_readable($settings_file)) {
+        try {
+            $data = @include($settings_file);
+        } catch (\Throwable $ex) {
+            fm_errlog('config', 'settings.php is damaged (' . $ex->getMessage() . ', line ' . $ex->getLine() . '), so the built-in defaults are used', $settings_file, 'error', 3600);
+        }
+        if ($data !== null && !is_array($data)) fm_errlog('config', 'settings.php does not return the expected list, so the built-in defaults are used', $settings_file, 'error', 86400);
+    }
     $out = array('settings' => array(), 'users' => null);
     if (is_array($data)) {
         if (isset($data['settings']) && is_array($data['settings'])) $out['settings'] = $data['settings'];
@@ -7566,8 +9408,12 @@ function fm_settings_apply($saved)
     foreach ($saved as $key => $v) {
         if (!isset($flat[$key])) continue;
         $def = $flat[$key];
+        $raw = $v;
         list($ok, $v) = fm_setting_clean($key, $def, $v, $key === 'root_path');
-        if (!$ok) continue;
+        if (!$ok) {
+            fm_errlog('config', 'Setting "' . (isset($def['label']) ? $def['label'] : $key) . '" (' . $key . ') in settings.php is not valid' . ($key === 'root_path' ? ' or the folder no longer exists' : '') . '; its default is used', 'value: ' . (is_scalar($raw) ? fm_cut(var_export($raw, true), 0, 200) : gettype($raw)), 'warning', 86400);
+            continue;
+        }
         if (isset($def['false_as']) && $v === $def['false_as']) $v = false;
         if (!empty($def['cfg'])) {
             $cfg[$key] = $v;
@@ -7639,7 +9485,11 @@ function fm_write_php_return($file, $data, $comment)
 {
     $php = "<?php\n" . $comment . "\nreturn " . var_export($data, true) . ";\n";
     $tmp = $file . '.tmp' . bin2hex(random_bytes(4));
-    if (@file_put_contents($tmp, $php, LOCK_EX) === false) return false;
+    // created owner-only from the start (password hashes): chmod alone fails where it is in disable_functions
+    $mask = @umask(0077);
+    $ok = @file_put_contents($tmp, $php, LOCK_EX);
+    @umask($mask);
+    if ($ok === false) return false;
     @chmod($tmp, 0600);
     if (function_exists('posix_geteuid') && posix_geteuid() === 0) {
         @chown($tmp, fileowner(dirname($file)));
@@ -7838,8 +9688,9 @@ function fm_settings_save_request($in)
     return array('ok' => true, 'errors' => array(), 'message' => 'Settings saved.');
 }
 
-function fm_set_msg($msg, $status = 'ok')
+function fm_set_msg($msg, $status = 'ok', $log = true)
 {
+    if ($status === 'error' && $log) fm_errlog('action', html_entity_decode(strip_tags($msg), ENT_QUOTES, 'UTF-8'));
     $_SESSION[FM_SESSION_ID]['message'] = $msg;
     $_SESSION[FM_SESSION_ID]['status'] = $status;
 }
@@ -8701,6 +10552,10 @@ function fm_show_nav_path($path, $show_bulk = false)
         $page = array('fa-key', 'Change password');
     } elseif (isset($_GET['environment'])) {
         $page = array('fa-server', 'Environment');
+    } elseif (isset($_GET['setup'])) {
+        $page = array('fa-stethoscope', 'Setup check');
+    } elseif (isset($_GET['errors'])) {
+        $page = array('fa-bug', 'Error log');
     } elseif (isset($_GET['help'])) {
         $page = array('fa-question-circle', lng('Help'));
     } elseif (isset($_GET['edit'])) {
@@ -8764,7 +10619,8 @@ function fm_show_nav_path($path, $show_bulk = false)
 
             <?php if (FM_USE_AUTH): ?>
                 <div class="dropdown fm-account">
-                    <button type="button" class="fm-account-toggle" data-bs-toggle="dropdown" aria-expanded="false">
+                    <?php $fm_upd = FM_CAN_CONFIGURE ? fm_update_cached() : null; $fm_upd_new = $fm_upd && !empty($fm_upd['newer']); $fm_err_new = FM_CAN_CONFIGURE ? fm_errlog_unread() : 0; ?>
+                    <button type="button" class="fm-account-toggle<?php echo $fm_upd_new ? ' has-update' : '' ?><?php echo $fm_err_new ? ' has-errors' : '' ?>" data-bs-toggle="dropdown" aria-expanded="false"<?php echo $fm_upd_new ? ' title="Version ' . fm_enc($fm_upd['latest']) . ' is available"' : '' ?>>
                         <span class="fm-avatar" aria-hidden="true"><?php echo fm_enc(strtoupper(substr($user, 0, 1))) ?></span>
                         <span class="fm-account-name"><?php echo fm_enc($user) ?></span>
                         <i class="fa fa-angle-down" aria-hidden="true"></i>
@@ -8790,6 +10646,15 @@ function fm_show_nav_path($path, $show_bulk = false)
                                     <span><strong>Environment</strong><small>Server, services, jobs and logs</small></span>
                                 </a>
                                 <?php endif ?>
+                                <a class="dropdown-item fm-account-item<?php echo isset($_GET['setup']) ? ' is-current' : '' ?>" href="<?php echo $self ?>&amp;setup=1"<?php echo isset($_GET['setup']) ? ' aria-current="page"' : '' ?>>
+                                    <span class="fm-account-icon is-setup"><i class="fa fa-stethoscope" aria-hidden="true"></i></span>
+                                    <span><strong>Setup check</strong><small>What is missing, and the fix</small></span>
+                                </a>
+                                <a class="dropdown-item fm-account-item<?php echo isset($_GET['errors']) ? ' is-current' : '' ?>" href="<?php echo $self ?>&amp;errors=1"<?php echo isset($_GET['errors']) ? ' aria-current="page"' : '' ?>>
+                                    <span class="fm-account-icon is-errors"><i class="fa fa-bug" aria-hidden="true"></i></span>
+                                    <span><strong>Error log</strong><small><?php echo $fm_err_new ? $fm_err_new . ($fm_err_new >= 99 ? '+' : '') . ' new since you last looked' : 'Nothing new' ?></small></span>
+                                    <?php if ($fm_err_new): ?><span class="fm-account-count"><?php echo $fm_err_new >= 99 ? '99+' : $fm_err_new ?></span><?php endif; ?>
+                                </a>
                             <?php endif ?>
                             <a class="dropdown-item fm-account-item<?php echo isset($_GET['changepwd']) ? ' is-current' : '' ?>" href="<?php echo $self ?>&amp;changepwd=1"<?php echo isset($_GET['changepwd']) ? ' aria-current="page"' : '' ?>>
                                 <span class="fm-account-icon is-password"><i class="fa fa-key" aria-hidden="true"></i></span>
@@ -8801,6 +10666,12 @@ function fm_show_nav_path($path, $show_bulk = false)
                             </a>
                         </div>
                         <div class="fm-account-foot">
+                            <div class="fm-account-version-row">
+                                <a class="dropdown-item fm-account-version" href="https://github.com/exavitech/tinyfilemanagerPlusPlus/blob/master/CHANGELOG.md" target="_blank" rel="noopener noreferrer" title="Tiny File Manager++ <?php echo fm_enc(VERSION) ?>: what's new in each version (opens GitHub)"><i class="fa fa-info-circle" aria-hidden="true"></i> <span><strong>Version <?php echo fm_enc(VERSION) ?></strong></span></a>
+                                <?php if (FM_CAN_CONFIGURE): ?>
+                                <button type="button" class="fm-update-btn<?php echo $fm_upd_new ? ' has-update' : '' ?>" id="js-update-btn"><?php if ($fm_upd_new): ?><i class="fa fa-arrow-circle-up" aria-hidden="true"></i> <span>Update to <?php echo fm_enc($fm_upd['latest']) ?></span><?php else: ?><i class="fa fa-refresh" aria-hidden="true"></i> <span>Check for updates</span><?php endif ?></button>
+                                <?php endif ?>
+                            </div>
                             <a class="dropdown-item fm-account-signout" href="?logout=1"><i class="fa fa-sign-out" aria-hidden="true"></i> <?php echo lng('Logout') ?></a>
                         </div>
                     </div>
@@ -9167,6 +11038,17 @@ function fm_show_theme_css()
             a:hover,
             a:focus {
                 color: var(--fm-accent-hover);
+            }
+
+            /* a link styled as a button keeps the button's colours, also once visited */
+            a.btn,
+            a.btn:visited {
+                color: var(--bs-btn-color);
+            }
+
+            a.btn:hover,
+            a.btn:focus-visible {
+                color: var(--bs-btn-hover-color);
             }
 
             :focus-visible {
@@ -11085,6 +12967,59 @@ function fm_show_theme_css()
 
             .fm-dest-note.is-problem i {
                 color: var(--fm-warning);
+            }
+
+            .fm-copy-mode-hint + .fm-conflict-label {
+                margin-top: 18px;
+            }
+
+            .fm-conflict-seg label {
+                padding: 6px 11px;
+            }
+
+            .fm-conflict-seg input:checked + label i.fa-step-forward {
+                color: var(--fm-muted);
+            }
+
+            .fm-conflict-seg input:checked + label i.fa-refresh {
+                color: var(--fm-warning);
+            }
+
+            .fm-conflict-seg input:checked + label i.fa-clone {
+                color: var(--fm-ic-copy);
+            }
+
+            .fm-copy-exists-count {
+                padding: 1px 8px;
+                border-radius: 999px;
+                background: var(--fm-warning-soft);
+                color: var(--fm-warning);
+                font-size: 12px;
+            }
+
+            .fm-copy-items li.is-conflict {
+                background: var(--fm-warning-soft);
+            }
+
+            .fm-copy-items li .fm-copy-each {
+                width: 118px;
+                padding: 2px 28px 2px 9px;
+                border-color: var(--fm-line-strong);
+                background-color: var(--fm-surface);
+                color: var(--fm-ink);
+                font-size: 12.5px;
+                font-weight: 500;
+                background-position: right 8px center;
+            }
+
+            .fm-copy-items li .fm-copy-exists {
+                flex: none;
+                margin-left: auto;
+                color: var(--fm-warning);
+                font-size: 12px;
+                font-weight: 600;
+                white-space: nowrap;
+                word-break: normal;
             }
 
             #js-copy-submit {
@@ -16083,6 +18018,7 @@ function fm_show_theme_css()
             .fm-set-tab[data-tab="overview"], .fm-set-panel[data-tab="overview"] { --c: var(--fm-ic-select); }
             .fm-set-tab[data-tab="storage"], .fm-set-panel[data-tab="storage"] { --c: var(--fm-ic-edit); }
             .fm-set-tab[data-tab="services"], .fm-set-panel[data-tab="services"] { --c: var(--fm-ic-link); }
+            .fm-set-tab[data-tab="setup"], .fm-set-panel[data-tab="setup"] { --c: var(--fm-ic-create); }
 
             .fm-set-tab {
                 padding: 5px 8px;
@@ -16142,6 +18078,624 @@ function fm_show_theme_css()
             .fm-account-icon.is-env { background: color-mix(in srgb, var(--fm-ic-link) 14%, transparent) !important; color: var(--fm-ic-link) !important; }
             .fm-account-icon.is-password { background: color-mix(in srgb, var(--fm-ic-edit) 16%, transparent) !important; color: var(--fm-ic-edit) !important; }
             .fm-account-icon.is-help { background: color-mix(in srgb, var(--fm-ic-tar) 14%, transparent) !important; color: var(--fm-ic-tar) !important; }
+            .fm-account-icon.is-setup, .fm-help-icon.is-setup { background: color-mix(in srgb, var(--fm-ic-create) 14%, transparent) !important; color: var(--fm-ic-create) !important; }
+
+            .fm-account-icon.is-errors { background: color-mix(in srgb, var(--fm-ic-delete) 14%, transparent) !important; color: var(--fm-ic-delete) !important; }
+
+            .fm-account-count {
+                margin-left: auto;
+                align-self: center;
+                min-width: 22px;
+                padding: 1px 7px;
+                border-radius: 999px;
+                background: var(--fm-danger-solid);
+                color: #fff;
+                font-size: 12px;
+                font-weight: 700;
+                text-align: center;
+            }
+
+            .fm-account-toggle.has-errors .fm-avatar::before {
+                content: "";
+                position: absolute;
+                bottom: -2px;
+                right: -2px;
+                width: 10px;
+                height: 10px;
+                border: 2px solid var(--fm-surface);
+                border-radius: 50%;
+                background: var(--fm-danger-solid);
+            }
+
+            /* ---- Error log ---- */
+            .fm-errlog {
+                display: flex;
+                flex-direction: column;
+                height: calc(100vh - 186px);
+                min-height: 420px;
+                margin: 0;
+                padding: 14px 16px;
+            }
+
+            .fm-errlog-bar {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 12px;
+            }
+
+            .fm-errlog-bar .fm-segmented em {
+                margin-left: 2px;
+                color: var(--fm-muted);
+                font-size: 12px;
+                font-style: normal;
+            }
+
+            .fm-errlog-search {
+                flex: 1 1 220px;
+                max-width: 360px;
+                margin-left: auto;
+            }
+
+            .fm-errlog-list {
+                flex: 1 1 auto;
+                min-height: 0;
+                overflow-y: auto;
+            }
+
+            .fm-errlog-item {
+                border: 1px solid var(--fm-line);
+                border-radius: 9px;
+            }
+
+            .fm-errlog-item + .fm-errlog-item {
+                margin-top: 5px;
+            }
+
+            .fm-errlog-item.is-new {
+                border-color: color-mix(in srgb, var(--fm-danger) 40%, var(--fm-line));
+            }
+
+            .fm-errlog-item summary {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+                padding: 8px 12px;
+                cursor: pointer;
+                list-style: none;
+            }
+
+            .fm-errlog-item summary::-webkit-details-marker {
+                display: none;
+            }
+
+            .fm-errlog-kind { width: 16px; text-align: center; }
+            .fm-errlog-item.is-bad .fm-errlog-kind { color: var(--fm-danger); }
+            .fm-errlog-item.is-warn .fm-errlog-kind { color: var(--fm-warning); }
+            .fm-errlog-item.is-note .fm-errlog-kind { color: var(--fm-muted); }
+
+            .fm-errlog-msg {
+                flex: 1 1 auto;
+                min-width: 0;
+                font-size: 13.5px;
+                overflow-wrap: anywhere;
+            }
+
+            .fm-errlog-when {
+                flex: none;
+                color: var(--fm-muted);
+                font-size: 12.5px;
+            }
+
+            .fm-errlog-item .fm-env-kv {
+                margin: 0 12px 6px 38px;
+                font-size: 13px;
+            }
+
+            .fm-errlog-item .fm-env-kv code {
+                word-break: break-all;
+            }
+
+            .fm-errlog-actions {
+                margin: 0 12px 10px 38px;
+                font-size: 12.5px;
+            }
+
+            .fm-errlog-empty {
+                padding: 30px 10px;
+                color: var(--fm-muted);
+                text-align: center;
+            }
+
+            .fm-errlog-empty i {
+                color: var(--fm-success);
+            }
+
+            .fm-errlog-clear {
+                display: inline;
+                margin: 0;
+            }
+
+            #fm-errlog-clear.is-armed {
+                border-color: var(--fm-danger);
+                color: var(--fm-danger);
+            }
+
+            @media (max-width: 767.98px) {
+                .fm-errlog {
+                    height: auto;
+                }
+
+                .fm-errlog-search {
+                    max-width: none;
+                    margin-left: 0;
+                }
+
+                .fm-errlog-item .fm-env-kv,
+                .fm-errlog-actions {
+                    margin-left: 12px;
+                }
+            }
+
+            /* ---- Setup check ---- */
+            .fm-setup-layout {
+                display: grid;
+                grid-template-columns: 300px minmax(0, 1fr);
+                gap: 16px;
+                height: calc(100vh - 186px);
+                min-height: 420px;
+            }
+
+            .fm-setup-side,
+            .fm-setup-main {
+                margin: 0;
+                padding: 14px 16px;
+                overflow-y: auto;
+            }
+
+            .fm-setup-side {
+                display: flex;
+                flex-direction: column;
+                padding: 20px 18px 16px;
+            }
+
+            .fm-setup-head-card {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                margin-bottom: 14px;
+            }
+
+            .fm-setup-score {
+                position: relative;
+                flex: none;
+                width: 92px;
+                height: 92px;
+            }
+
+            .fm-setup-ring {
+                width: 100%;
+                height: 100%;
+            }
+
+            .fm-setup-ring circle {
+                fill: none;
+                stroke-width: 9;
+                stroke-linecap: butt;
+            }
+
+            .fm-setup-ring .is-track { stroke: var(--fm-tier); }
+            .fm-setup-ring .is-fail { stroke: var(--fm-danger); }
+            .fm-setup-ring .is-warn { stroke: var(--fm-warning); }
+            .fm-setup-ring .is-info { stroke: color-mix(in srgb, var(--fm-muted) 55%, transparent); }
+            .fm-setup-ring .is-ok { stroke: var(--fm-success); }
+
+            .fm-setup-ring-label {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                line-height: 1.1;
+            }
+
+            .fm-setup-ring-label strong {
+                font-size: 24px;
+                font-weight: 700;
+                letter-spacing: -.02em;
+                color: var(--fm-ink);
+            }
+
+            .fm-setup-ring-label span {
+                color: var(--fm-muted);
+                font-size: 12.5px;
+            }
+
+            .fm-setup-verdict {
+                margin: 0;
+                font-size: 15px;
+                font-weight: 700;
+                line-height: 1.3;
+            }
+
+            .fm-setup-verdict.is-fail { color: var(--fm-danger); }
+            .fm-setup-verdict.is-warn { color: var(--fm-warning); }
+            .fm-setup-verdict.is-ok { color: var(--fm-success); }
+
+            .fm-setup-checked {
+                margin: 4px 0 0;
+                color: var(--fm-muted);
+                font-size: 12.5px;
+                line-height: 1.45;
+            }
+
+            .fm-setup-filters {
+                display: grid;
+                gap: 2px;
+                padding: 4px;
+                border: 1px solid var(--fm-line);
+                border-radius: 10px;
+                background: var(--fm-tier);
+            }
+
+            .fm-setup-filter {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                width: 100%;
+                padding: 5px 10px;
+                border: 0;
+                border-radius: 7px;
+                background: transparent;
+                color: var(--fm-ink);
+                font-size: 13.5px;
+                text-align: left;
+                transition: background-color .12s;
+            }
+
+            .fm-setup-filter:hover:not(:disabled) {
+                background: var(--fm-hover);
+            }
+
+            .fm-setup-filter[aria-pressed="true"] {
+                background: var(--fm-surface);
+                box-shadow: var(--fm-shadow);
+                font-weight: 600;
+            }
+
+            .fm-setup-filter:disabled {
+                opacity: .45;
+                cursor: default;
+            }
+
+            .fm-setup-filter i { width: 16px; text-align: center; }
+            .fm-setup-filter.is-fail i { color: var(--fm-danger); }
+            .fm-setup-filter.is-warn i { color: var(--fm-warning); }
+            .fm-setup-filter.is-info i { color: var(--fm-muted); }
+            .fm-setup-filter.is-ok i { color: var(--fm-success); }
+
+            .fm-setup-filter em {
+                margin-left: auto;
+                min-width: 26px;
+                padding: 0 7px;
+                border-radius: 999px;
+                background: var(--fm-surface);
+                color: var(--fm-muted);
+                font-size: 12px;
+                font-style: normal;
+                font-weight: 600;
+                text-align: center;
+            }
+
+            .fm-setup-filter.is-fail:not(:disabled) em { background: var(--fm-danger-soft); color: var(--fm-danger); }
+            .fm-setup-filter.is-warn:not(:disabled) em { background: var(--fm-warning-soft); color: var(--fm-warning); }
+
+            .fm-setup-side-h {
+                margin: 18px 0 6px;
+                color: var(--fm-muted);
+                font-size: 11.5px;
+                font-weight: 700;
+                letter-spacing: .06em;
+                text-transform: uppercase;
+            }
+
+            .fm-setup-facts {
+                margin: 0;
+                padding: 0;
+                list-style: none;
+            }
+
+            .fm-setup-facts li {
+                display: grid;
+                grid-template-columns: 16px 50px minmax(0, 1fr);
+                gap: 8px;
+                padding: 5px 0;
+                font-size: 13px;
+            }
+
+            .fm-setup-facts li + li {
+                border-top: 1px solid var(--fm-line);
+            }
+
+            .fm-setup-facts li > i.fa {
+                margin-top: 3px;
+                color: var(--fm-muted) !important;
+                text-align: center;
+            }
+
+            .fm-setup-fact-k {
+                color: var(--fm-muted);
+            }
+
+            .fm-setup-facts strong {
+                display: block;
+                font-weight: 600;
+                overflow-wrap: break-word;
+            }
+
+            .fm-setup-facts strong span {
+                color: var(--fm-muted);
+                font-weight: 500;
+            }
+
+            .fm-setup-facts small {
+                display: block;
+                color: var(--fm-muted);
+                font-size: 12px;
+                overflow-wrap: break-word;
+            }
+
+            .fm-setup-facts code {
+                color: inherit;
+                font-size: 12px;
+                overflow-wrap: break-word;
+            }
+
+            .fm-setup-facts strong code {
+                font-size: 12.5px;
+                font-weight: 500;
+            }
+
+            .fm-setup-intro {
+                margin: 0 0 12px;
+                color: var(--fm-muted);
+                font-size: 13px;
+            }
+
+            .fm-setup-intro i {
+                color: var(--fm-success);
+            }
+
+            /* a status chosen in the side panel shows only that status (passing included when chosen) */
+            .fm-setup[data-only] .fm-setup-item {
+                display: none !important;
+            }
+
+            .fm-setup[data-only="fail"] .fm-setup-item[data-status="fail"],
+            .fm-setup[data-only="warn"] .fm-setup-item[data-status="warn"],
+            .fm-setup[data-only="info"] .fm-setup-item[data-status="info"],
+            .fm-setup[data-only="ok"] .fm-setup-item[data-status="ok"] {
+                display: block !important;
+            }
+
+            .fm-setup-group + .fm-setup-group {
+                margin-top: 14px;
+            }
+
+            .fm-setup-group h3 {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin: 0 0 6px;
+                font-size: 14px;
+                font-weight: 700;
+            }
+
+            .fm-setup .fm-setup-group h3 > i.fa {
+                color: var(--fm-ic-create) !important;
+            }
+
+            .fm-setup-pass {
+                color: var(--fm-muted);
+                font-size: 12.5px;
+                font-weight: 500;
+            }
+
+            .fm-setup.show-ok .fm-setup-pass {
+                display: none;
+            }
+
+
+            .fm-setup-head {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 6px 14px;
+            }
+
+            .fm-setup-tools {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin-left: auto;
+            }
+
+            .fm-setup-tools .fm-env-toggle {
+                margin: 0;
+            }
+
+            .fm-setup-item {
+                border: 1px solid var(--fm-line);
+                border-radius: 9px;
+                background: var(--fm-surface);
+            }
+
+            .fm-setup-item + .fm-setup-item {
+                margin-top: 5px;
+            }
+
+            .fm-setup:not(.show-ok) .fm-setup-item[data-status="ok"] {
+                display: none;
+            }
+
+            .fm-setup-row {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+                padding: 7px 12px;
+                list-style: none;
+                cursor: default;
+            }
+
+            summary.fm-setup-row {
+                cursor: pointer;
+            }
+
+            summary.fm-setup-row::-webkit-details-marker {
+                display: none;
+            }
+
+            .fm-setup-st { width: 16px; text-align: center; }
+            .fm-setup-item.is-ok .fm-setup-st { color: var(--fm-success); }
+            .fm-setup-item.is-fail .fm-setup-st { color: var(--fm-danger); }
+            .fm-setup-item.is-warn .fm-setup-st { color: var(--fm-warning); }
+            .fm-setup-item.is-info .fm-setup-st { color: var(--fm-muted); }
+            .fm-setup-item.is-fail { border-color: color-mix(in srgb, var(--fm-danger) 40%, var(--fm-line)); }
+
+            .fm-setup-row > i,
+            .fm-setup-row > .fm-env-badge {
+                flex: none;
+                margin-top: 2px;
+            }
+
+            .fm-setup-title {
+                flex: none;
+                max-width: 45%;
+                font-weight: 600;
+                font-size: 13.5px;
+            }
+
+            .fm-setup-val {
+                flex: 1 1 auto;
+                min-width: 0;
+                color: var(--fm-muted);
+                font-size: 13px;
+                overflow-wrap: anywhere;
+            }
+
+            .fm-env-badge.is-note {
+                color: var(--fm-muted);
+            }
+
+            .fm-setup-chev {
+                color: var(--fm-muted);
+                transition: transform .15s;
+            }
+
+            details[open] > summary .fm-setup-chev {
+                transform: rotate(180deg);
+            }
+
+            .fm-setup-why {
+                margin: -2px 12px 8px 38px;
+                color: var(--fm-muted);
+                font-size: 13px;
+            }
+
+
+            .fm-setup-body {
+                margin: 0 12px 10px 38px;
+            }
+
+            .fm-setup-fix,
+            .fm-setup-probe {
+                margin: 0 0 6px;
+                font-size: 13px;
+            }
+
+            .fm-setup-probe-out {
+                margin-left: 6px;
+                color: var(--fm-muted);
+            }
+
+            .fm-setup-cmd {
+                display: grid;
+                grid-template-columns: 112px minmax(0, 1fr) auto;
+                align-items: start;
+                gap: 8px;
+                margin-top: 5px;
+            }
+
+            .fm-setup-cmd > span {
+                padding-top: 6px;
+                color: var(--fm-muted);
+                font-size: 12px;
+            }
+
+            .fm-setup-cmd pre {
+                margin: 0;
+                padding: 6px 10px;
+                overflow-x: auto;
+                border-radius: 7px;
+                background: var(--fm-tier);
+                border: 1px solid var(--fm-line);
+                font-size: 12.5px;
+                white-space: pre-wrap;
+                word-break: break-all;
+            }
+
+            .fm-setup-cmd code {
+                color: var(--fm-ink);
+            }
+
+            .fm-env-main .fm-setup .fm-setup-item {
+                background: transparent;
+            }
+
+            .fm-help-setup {
+                margin-bottom: 16px;
+            }
+
+            .fm-setup-page .fm-env-head-actions .btn,
+            .fm-setup-page .fm-env-head-actions .fm-env-toggle {
+                white-space: nowrap;
+            }
+
+            @media (max-width: 767.98px) {
+                .fm-setup-page .fm-env-head-actions {
+                    flex-wrap: wrap;
+                }
+
+                .fm-setup-layout {
+                    grid-template-columns: 1fr;
+                    height: auto;
+                }
+
+                .fm-setup-side,
+                .fm-setup-main {
+                    overflow: visible;
+                }
+
+                .fm-setup-cmd {
+                    grid-template-columns: minmax(0, 1fr) auto;
+                }
+
+                .fm-setup-cmd > span {
+                    grid-column: 1 / -1;
+                    padding: 0;
+                }
+
+                .fm-setup-why,
+                .fm-setup-body {
+                    margin-left: 12px;
+                }
+
+                .fm-setup-val {
+                    display: none;
+                }
+            }
 
             /* the last grey action icons */
             .fm-topbar .fm-btn i.fa-download { color: var(--fm-ic-download); }
@@ -16544,6 +19098,265 @@ function fm_show_theme_css()
                 color: var(--fm-danger);
             }
 
+            .fm-account-version-row {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+
+            .fm-account-version-row .fm-account-version {
+                flex: 1 1 auto;
+                min-width: 0;
+            }
+
+            .fm-update-btn {
+                flex: none;
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                margin-right: 4px;
+                padding: 3px 10px;
+                border: 1px solid var(--fm-line);
+                border-radius: 999px;
+                background: var(--fm-surface);
+                color: var(--fm-muted);
+                font-size: 12px;
+                font-weight: 500;
+                white-space: nowrap;
+                transition: background-color .12s, color .12s, border-color .12s;
+            }
+
+            .fm-update-btn:hover,
+            .fm-update-btn:focus-visible {
+                border-color: var(--fm-line-strong);
+                background: var(--fm-hover);
+                color: var(--fm-ink);
+            }
+
+            .fm-update-btn.is-latest {
+                color: var(--fm-success);
+            }
+
+            .fm-update-btn.has-update {
+                border-color: var(--fm-accent);
+                background: var(--fm-accent);
+                color: #fff;
+                font-weight: 600;
+            }
+
+            .fm-update-btn.has-update:hover {
+                background: var(--fm-accent);
+                color: #fff;
+                filter: brightness(1.08);
+            }
+
+            .fm-update-btn:disabled {
+                opacity: .7;
+            }
+
+            .fm-account-toggle .fm-avatar {
+                position: relative;
+            }
+
+            .fm-account-toggle.has-update .fm-avatar::after {
+                content: "";
+                position: absolute;
+                top: -2px;
+                right: -2px;
+                width: 10px;
+                height: 10px;
+                border: 2px solid var(--fm-surface);
+                border-radius: 50%;
+                background: var(--fm-accent);
+            }
+
+            #fm-update-modal .modal-title i {
+                color: var(--fm-accent);
+                margin-right: 4px;
+            }
+
+            .fm-update-versions {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 10px;
+                margin-bottom: 14px;
+                color: var(--fm-muted);
+            }
+
+            .fm-update-ver {
+                padding: 3px 12px;
+                border: 1px solid var(--fm-line);
+                border-radius: 999px;
+                background: var(--fm-tier);
+                color: var(--fm-ink);
+                font-size: 14px;
+                font-weight: 600;
+            }
+
+            .fm-update-ver.is-new {
+                border-color: transparent;
+                background: var(--fm-accent-soft);
+                color: var(--fm-accent);
+            }
+
+            .fm-update-note {
+                font-size: 13.5px;
+            }
+
+            .fm-update-notes {
+                max-height: 260px;
+                margin-bottom: 12px;
+                padding: 4px 14px;
+                overflow-y: auto;
+                border: 1px solid var(--fm-line);
+                border-radius: 10px;
+                font-size: 13.5px;
+            }
+
+            .fm-update-notes section + section {
+                border-top: 1px solid var(--fm-line);
+            }
+
+            .fm-update-notes h6 {
+                margin: 10px 0 6px;
+                font-size: 13.5px;
+                font-weight: 700;
+            }
+
+            .fm-update-notes h6 small {
+                margin-left: 6px;
+                color: var(--fm-muted);
+                font-weight: 500;
+            }
+
+            .fm-update-notes p,
+            .fm-update-notes ul {
+                margin: 0 0 8px;
+            }
+
+            .fm-update-notes ul {
+                padding-left: 18px;
+            }
+
+            .fm-update-notes .fm-update-h {
+                margin-top: 8px;
+                font-weight: 600;
+            }
+
+            .fm-update-safe {
+                display: flex;
+                gap: 8px;
+                margin: 0 0 4px;
+                font-size: 13px;
+            }
+
+            .fm-update-safe i {
+                margin-top: 3px;
+                color: var(--fm-success);
+            }
+
+            .fm-update-status {
+                display: flex;
+                align-items: flex-start;
+                gap: 8px;
+                margin-top: 10px;
+                padding: 10px 12px;
+                border-radius: 8px;
+                font-size: 13.5px;
+            }
+
+            .fm-update-status i {
+                margin-top: 3px;
+            }
+
+            .fm-update-status.is-busy {
+                background: var(--fm-accent-soft);
+            }
+
+            .fm-update-status.is-busy .fm-hint {
+                display: block;
+                margin-top: 2px;
+            }
+
+            .fm-update-status.is-ok {
+                background: var(--fm-success-soft);
+            }
+
+            .fm-update-status.is-ok i {
+                color: var(--fm-success);
+            }
+
+            .fm-update-status.is-error {
+                background: var(--fm-danger-soft);
+            }
+
+            .fm-update-status.is-error i {
+                color: var(--fm-danger);
+            }
+
+            #js-update-go i {
+                color: inherit !important;
+            }
+
+            #fm-update-modal .fm-update-rollback {
+                margin-right: auto;
+                padding-left: 0;
+                font-size: 13.5px;
+                text-decoration: none;
+            }
+
+            #fm-update-modal .fm-update-rollback {
+                --bs-btn-color: var(--fm-muted);
+                --bs-btn-hover-color: var(--fm-danger);
+                --bs-btn-active-color: var(--fm-danger);
+            }
+
+            #fm-update-modal .fm-update-rollback.is-armed {
+                --bs-btn-color: var(--fm-danger);
+                font-weight: 600;
+            }
+
+            .fm-topbar .fm-account-version,
+            .fm-topbar .fm-account-version:visited {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 6px 10px;
+                border-radius: 8px;
+                color: var(--fm-muted);
+                font-size: 12.5px;
+            }
+
+            .fm-topbar .fm-account-version strong {
+                color: var(--fm-ink);
+                font-weight: 600;
+            }
+
+            .fm-topbar .fm-account-version i.fa-info-circle {
+                width: 32px;
+                color: var(--fm-muted) !important;
+                text-align: center;
+            }
+
+            .fm-topbar .fm-account-version .fm-account-version-go {
+                margin-left: auto;
+                font-size: 11px;
+                opacity: 0;
+                transition: opacity .12s;
+            }
+
+            .fm-topbar .fm-account-version:hover,
+            .fm-topbar .fm-account-version:focus {
+                background: var(--fm-hover);
+                color: var(--fm-ink);
+            }
+
+            .fm-topbar .fm-account-version:hover .fm-account-version-go,
+            .fm-topbar .fm-account-version:focus .fm-account-version-go {
+                opacity: .7;
+            }
+
             /* ---- upload from computer: results list (same rows as URL uploads) ---- */
             .fm-dz-results {
                 margin-top: 16px;
@@ -16705,6 +19518,10 @@ function fm_show_theme_css()
             .fm-copy-panel .fm-dest-list {
                 height: auto;
                 max-height: 340px;
+            }
+
+            .fm-copy-panel .fm-card-actions.has-conflict .fm-conflict-seg {
+                margin-right: auto;
             }
 
             .fm-copy-panel .fm-card-actions {
@@ -17112,6 +19929,8 @@ function fm_show_header_login()
         elseif (isset($_GET['settings'])) $screen = 'Settings';
         elseif (isset($_GET['changepwd'])) $screen = 'Change password';
         elseif (isset($_GET['environment'])) $screen = 'Environment';
+        elseif (isset($_GET['setup'])) $screen = 'Setup check';
+        elseif (isset($_GET['errors'])) $screen = 'Error log';
         elseif (isset($_GET['help'])) $screen = 'Help';
         elseif (isset($_GET['chmod'])) $screen = 'Permissions of ' . basename($_GET['chmod']);
         elseif (isset($_GET['copy']) || isset($_POST['copy'])) $screen = 'Copy or move';
@@ -18222,6 +21041,17 @@ function fm_show_header_login()
                                         <label for="js-mode-move"><i class="fa fa-arrow-right" aria-hidden="true"></i> <?php echo lng('Move') ?></label>
                                     </div>
                                     <p class="fm-hint fm-copy-mode-hint" id="js-copy-mode-hint">A copy is made; the originals stay where they are.</p>
+
+                                    <h6 class="fm-copy-label fm-conflict-label">If a name already exists <span class="fm-copy-exists-count" id="js-conflict-count" hidden></span></h6>
+                                    <div class="fm-segmented fm-conflict-seg" role="radiogroup" aria-label="If a name already exists">
+                                        <input type="radio" name="conflict" id="js-conflict-skip" value="skip" checked>
+                                        <label for="js-conflict-skip"><i class="fa fa-step-forward" aria-hidden="true"></i> Skip</label>
+                                        <input type="radio" name="conflict" id="js-conflict-overwrite" value="overwrite">
+                                        <label for="js-conflict-overwrite"><i class="fa fa-refresh" aria-hidden="true"></i> Overwrite</label>
+                                        <input type="radio" name="conflict" id="js-conflict-keep" value="keep">
+                                        <label for="js-conflict-keep"><i class="fa fa-clone" aria-hidden="true"></i> Keep both</label>
+                                    </div>
+                                    <p class="fm-hint fm-copy-mode-hint" id="js-conflict-hint"></p>
                                 </section>
 
                                 <section>
@@ -18411,6 +21241,196 @@ function fm_show_header_login()
                 hljs.highlightAll();
                 var isHighlightingEnabled = true;
             </script>
+        <?php endif; ?>
+        <?php if (FM_CAN_CONFIGURE): ?>
+        <!-- Update dialog (account menu > Check for updates) -->
+        <div class="modal fade" id="fm-update-modal" tabindex="-1" aria-labelledby="fm-update-title" aria-hidden="true" data-bs-theme="<?php echo FM_THEME; ?>">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="fm-update-title"><i class="fa fa-arrow-circle-up" aria-hidden="true"></i> <span>Updates</span></h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="fm-update-versions" id="js-update-versions"></div>
+                        <div class="fm-update-notes" id="js-update-notes" hidden></div>
+                        <p class="fm-hint fm-update-safe" id="js-update-safe" hidden><i class="fa fa-shield" aria-hidden="true"></i> <span>Your settings, users and logos live in <code>settings.php</code> and stay as they are. The current version is kept, so you can roll back.</span></p>
+                        <div class="fm-update-status" id="js-update-status" role="status" aria-live="polite" hidden></div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-link fm-update-rollback" id="js-update-rollback" hidden></button>
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="js-update-close">Close</button>
+                        <button type="button" class="btn btn-primary" id="js-update-go" hidden><i class="fa fa-download" aria-hidden="true"></i> <span>Update now</span></button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+            // Updates: the button in the account menu, the dot on the avatar, the daily background check and the dialog
+            (function() {
+                var U = <?php
+                    $fm_upd = fm_update_cached();
+                    echo json_encode(array(
+                        'auto' => FM_UPDATE_CHECK,
+                        'stale' => !$fm_upd || time() - (int) $fm_upd['checked'] >= 86400,
+                        'state' => $fm_upd ? fm_update_public($fm_upd) : null,
+                    ));
+                ?>,
+                    busy = false,
+                    rollArmed = false;
+
+                function esc(t) {
+                    return String(t).replace(/[&<>"']/g, function(c) {
+                        return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+                    });
+                }
+
+                // release notes: plain text with "- " bullets, "#" headings, `code` and **bold** (everything escaped first)
+                function notes(md) {
+                    var html = '', list = false;
+                    String(md || '').replace(/\r/g, '').split('\n').forEach(function(line) {
+                        var t = esc(line.trim()).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>'),
+                            bullet = /^[-*] /.test(line.trim());
+                        if (bullet && !list) { html += '<ul>'; list = true; }
+                        if (!bullet && list) { html += '</ul>'; list = false; }
+                        if (bullet) html += '<li>' + t.slice(2) + '</li>';
+                        else if (/^#+ /.test(line.trim())) html += '<p class="fm-update-h">' + t.replace(/^#+ /, '') + '</p>';
+                        else if (t) html += '<p>' + t + '</p>';
+                    });
+                    return html + (list ? '</ul>' : '');
+                }
+
+                function post(type, extra) {
+                    var fd = new FormData();
+                    fd.append('ajax', 'true');
+                    fd.append('type', type);
+                    fd.append('token', window.csrf);
+                    $.each(extra || {}, function(k, v) {
+                        fd.append(k, v);
+                    });
+                    return $.ajax({url: window.location.href, type: 'POST', data: fd, processData: false, contentType: false, dataType: 'json', timeout: 240000});
+                }
+
+                function button(mode, text) {
+                    var icon = {check: 'fa-refresh', busy: 'fa-circle-o-notch fa-spin', newer: 'fa-arrow-circle-up', latest: 'fa-check'}[mode];
+                    $('#js-update-btn').toggleClass('has-update', mode === 'newer').toggleClass('is-latest', mode === 'latest').prop('disabled', mode === 'busy')
+                        .html('<i class="fa ' + icon + '" aria-hidden="true"></i> <span>' + esc(text) + '</span>');
+                }
+
+                function mark(d) {
+                    U.state = d;
+                    var newer = !!(d && d.ok && d.newer);
+                    $('.fm-account-toggle').toggleClass('has-update', newer).attr('title', newer ? 'Version ' + d.latest + ' is available' : null);
+                    if (newer) button('newer', 'Update to ' + d.latest);
+                    else if (d && d.ok) button('latest', 'Up to date');
+                    else button('check', 'Check for updates');
+                }
+
+                function status(kind, html) {
+                    $('#js-update-status').prop('hidden', !kind).attr('class', 'fm-update-status' + (kind ? ' is-' + kind : '')).html(html || '');
+                }
+
+                function show(d) {
+                    d = d || {};
+                    var newer = d.ok && d.newer;
+                    rollArmed = false;
+                    $('#fm-update-title span').text(newer ? 'Update available' : (d.ok ? 'You\'re up to date' : 'Updates'));
+                    $('#js-update-versions').html(newer
+                        ? '<span class="fm-update-ver">' + esc(d.current) + '</span><i class="fa fa-long-arrow-right" aria-hidden="true"></i><span class="fm-update-ver is-new">' + esc(d.latest) + '</span>'
+                        : '<span class="fm-update-ver is-new">' + esc(d.current || '') + '</span>' + (d.ok ? '<span class="fm-update-note">This is the latest version.</span>' : ''));
+                    var $n = $('#js-update-notes').empty().prop('hidden', !newer || !(d.notes || []).length);
+                    (d.notes || []).forEach(function(r) {
+                        $n.append('<section><h6>Version ' + esc(r.version) + (r.date ? ' <small>' + esc(r.date) + '</small>' : '') + '</h6>' + (notes(r.body) || '<p class="fm-hint">No notes for this release.</p>') + '</section>');
+                    });
+                    $('#js-update-safe').prop('hidden', !newer);
+                    $('#js-update-go').prop('hidden', !newer).prop('disabled', !d.writable).find('span').text('Update now');
+                    $('#js-update-rollback').prop('hidden', !d.backup).html('<i class="fa fa-undo" aria-hidden="true"></i> Roll back to ' + esc(d.backup || ''));
+                    if (!d.ok && d.message) status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + esc(d.message));
+                    else if (newer && !d.writable) status('error', '<i class="fa fa-lock" aria-hidden="true"></i> PHP may not replace this file on this server. <a href="' + esc(d.page) + '" target="_blank" rel="noopener noreferrer">Download it from GitHub</a> and replace it by hand.');
+                    else status('');
+                    var el = document.getElementById('fm-update-modal');
+                    bootstrap.Modal.getOrCreateInstance(el).show();
+                }
+
+                function check(force, open) {
+                    if (busy) return;
+                    busy = true;
+                    if (open) button('busy', 'Checking…');
+                    post('update_check', {force: force ? '1' : ''}).done(function(d) {
+                        mark(d);
+                        if (open) show(d);
+                    }).fail(function() {
+                        if (open) {
+                            button('check', 'Check for updates');
+                            show({ok: false, message: 'The check did not finish. Reload the page and try again.'});
+                        }
+                    }).always(function() {
+                        busy = false;
+                    });
+                }
+
+                function act(type) {
+                    busy = true;
+                    $('#js-update-go, #js-update-rollback, #js-update-close').prop('disabled', true);
+                    $('#fm-update-modal .btn-close').prop('disabled', true);
+                    status('busy', '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> ' + (type === 'update_install' ? 'Downloading, checking and installing version ' + esc(U.state.latest) + '…' : 'Rolling back…') + ' <span class="fm-hint">This can take up to a minute. Keep this page open.</span>');
+                    post(type).done(function(d) {
+                        if (d.ok && d.done) {
+                            status('ok', '<i class="fa fa-check-circle" aria-hidden="true"></i> ' + esc(d.message) + ' Reloading…');
+                            setTimeout(function() {
+                                location.reload();
+                            }, 1500);
+                            return;
+                        }
+                        busy = false;
+                        status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + esc(d.message || 'That did not work.'));
+                        $('#js-update-go, #js-update-rollback, #js-update-close, #fm-update-modal .btn-close').prop('disabled', false);
+                        $('#js-update-go span').text('Try again');
+                    }).fail(function(xhr) {
+                        busy = false;
+                        status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> The server did not answer (' + esc(xhr.status || 'timeout') + '). Reload the page to see which version is running.');
+                        $('#js-update-close, #fm-update-modal .btn-close').prop('disabled', false);
+                    });
+                }
+
+                $(document).on('click', '#js-update-btn', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation(); // keep the account menu from closing on its own
+                    var toggle = document.querySelector('.fm-account-toggle');
+                    if (U.state && U.state.ok && U.state.newer) {
+                        if (toggle) bootstrap.Dropdown.getOrCreateInstance(toggle).hide();
+                        show(U.state);
+                        return;
+                    }
+                    check(true, true);
+                });
+                $(document).on('show.bs.modal', '#fm-update-modal', function() {
+                    var toggle = document.querySelector('.fm-account-toggle');
+                    if (toggle) bootstrap.Dropdown.getOrCreateInstance(toggle).hide();
+                });
+                $(document).on('click', '#js-update-go', function() {
+                    act('update_install');
+                });
+                // two clicks: a confirmation without a browser dialog
+                $(document).on('click', '#js-update-rollback', function() {
+                    if (!rollArmed) {
+                        rollArmed = true;
+                        $(this).addClass('is-armed').html('<i class="fa fa-undo" aria-hidden="true"></i> Click again to roll back to ' + esc(U.state.backup));
+                        return;
+                    }
+                    act('update_rollback');
+                });
+                $(document).on('hide.bs.modal', '#fm-update-modal', function(e) {
+                    if (busy) e.preventDefault(); // never close while the file is being replaced
+                });
+
+                if (U.state && U.state.ok && !U.state.newer) button('check', 'Check for updates');
+                // once a day, quietly, a few seconds after the page has loaded
+                if (U.auto && U.stale) setTimeout(function() {
+                    check(false, false);
+                }, 3000);
+            })();
+        </script>
         <?php endif; ?>
         <script>
             function template(html, options) {
@@ -19088,7 +22108,10 @@ function fm_show_header_login()
                 source: <?php echo json_encode(FM_PATH); ?>,
                 root: <?php echo json_encode(rtrim(FM_ROOT_PATH, '/')); ?>,
                 names: [],
-                dest: ''
+                dest: '',
+                conflicts: [],
+                checking: false,
+                choice: {} // per-item choice for clashing names: name -> skip|overwrite|keep
             };
 
             function fm_esc(t) {
@@ -19112,10 +22135,12 @@ function fm_show_header_login()
                 $('#js-copy-items').empty();
                 names.forEach(function(n) {
                     $('<input type="hidden" name="file[]">').val(n).appendTo('#js-copy-inputs');
-                    $('<li>').append(fm_file_badge(n, fm_row_is_folder(n))).append($('<span>').text(n)).appendTo('#js-copy-items');
+                    $('<li>').attr('data-name', n).append(fm_file_badge(n, fm_row_is_folder(n))).append($('<span>').text(n)).appendTo('#js-copy-items');
                 });
                 $('#js-copy-count').text(names.length);
                 $('#js-mode-copy').prop('checked', true);
+                $('#js-conflict-skip').prop('checked', true);
+                fmCopy.choice = {};
                 fm_copy_mode();
                 fm_copy_load(fmCopy.source);
                 $('#copyModal').modal('show');
@@ -19131,11 +22156,140 @@ function fm_show_header_login()
                 fm_copy_validate();
             }
 
+            // Which chosen items already exist in the destination (asked again whenever the destination changes)
+            function fm_copy_conflicts(path) {
+                fmCopy.conflicts = [];
+                $('#js-copy-items .fm-copy-exists').remove();
+                fmCopy.checking = path !== fmCopy.source;
+                fm_copy_validate();
+                if (!fmCopy.checking) return;
+                var fd = new FormData();
+                fd.append('ajax', 'true');
+                fd.append('type', 'conflicts');
+                fd.append('path', path);
+                fd.append('token', window.csrf);
+                fmCopy.names.forEach(function(n) {
+                    fd.append('file[]', n);
+                });
+                $.ajax({
+                    url: window.location.href,
+                    type: 'POST',
+                    data: fd,
+                    processData: false,
+                    contentType: false
+                }).done(function(res) {
+                    if (fmCopy.dest !== path) return;
+                    var data = typeof res === 'string' ? JSON.parse(res) : res;
+                    fmCopy.conflicts = data.conflicts || [];
+                }).always(function() {
+                    if (fmCopy.dest !== path) return;
+                    fmCopy.checking = false;
+                    fm_copy_validate();
+                });
+            }
+
+            // The choice that applies to one item: its own (set in its row) or the one for all; a file can't replace a folder, so that one is skipped
+            function fm_copy_item_mode(c) {
+                var all = $('input[name="conflict"]:checked').val() || 'skip',
+                    mode = fmCopy.choice[c.name] || all;
+                return mode === 'overwrite' && c.dir !== fm_row_is_folder(c.name) ? 'skip' : mode;
+            }
+
+            function fm_copy_conflict_hint() {
+                var n = fmCopy.conflicts.length,
+                    move = $('#js-mode-move').is(':checked'),
+                    all = $('input[name="conflict"]:checked').val(),
+                    one = n === 1,
+                    hints = {
+                        skip: 'The existing ' + (one ? 'item stays' : 'items stay') + '; you will see which ' + (one ? 'one was' : 'ones were') + ' skipped.',
+                        overwrite: 'Files are replaced. Folders are merged: matching files inside are replaced, the others are kept.',
+                        keep: 'The new ' + (move ? 'item gets' : 'copy gets') + ' a free name, such as "report (1).pdf".'
+                    };
+                $('#js-conflict-hint').text(all ? hints[all] : 'Chosen per item in the list above. Pick one here to use it for all of them.');
+                $('#js-conflict-count').prop('hidden', !n).text(n + ' already there');
+                $('#js-copy-items li').each(function() {
+                    var $li = $(this),
+                        name = this.getAttribute('data-name'),
+                        hit = fmCopy.conflicts.filter(function(c) {
+                            return c.name === name;
+                        })[0];
+                    $li.toggleClass('is-conflict', !!hit);
+                    if (!hit) {
+                        $li.find('.fm-copy-exists').remove();
+                        return;
+                    }
+                    var $sel = $li.find('select.fm-copy-each');
+                    if (!$sel.length) {
+                        var clash = hit.dir !== fm_row_is_folder(name);
+                        $sel = $('<select class="form-select form-select-sm fm-copy-each">').attr('aria-label', 'If "' + name + '" already exists')
+                            .append($('<option value="skip">').text('Skip'))
+                            .append($('<option value="overwrite">').text(clash ? (hit.dir ? 'Overwrite (a folder is there)' : 'Overwrite (a file is there)') : 'Overwrite').prop('disabled', clash))
+                            .append($('<option value="keep">').text('Keep both'))
+                            .on('change', function() {
+                                // freeze what every other row gets now, since the "for all" choice may be cleared below
+                                fmCopy.conflicts.forEach(function(c) {
+                                    fmCopy.choice[c.name] = fm_copy_item_mode(c);
+                                });
+                                fmCopy.choice[name] = this.value;
+                                // all rows the same again? show that choice above; otherwise none is "for all"
+                                var modes = fmCopy.conflicts.map(fm_copy_item_mode).filter(function(m, k, a) {
+                                    return a.indexOf(m) === k;
+                                });
+                                $('input[name="conflict"]').prop('checked', false);
+                                if (modes.length === 1) {
+                                    $('#js-conflict-' + modes[0]).prop('checked', true);
+                                    fmCopy.choice = {};
+                                }
+                                fm_copy_validate();
+                            });
+                        $li.find('.fm-copy-exists').remove();
+                        $li.append($('<span class="fm-copy-exists">').append($sel));
+                        if (clash) $sel.attr('title', 'A file can\'t replace a folder (or the other way round)');
+                    }
+                    $sel.val(fm_copy_item_mode(hit));
+                });
+                if (!n) return '';
+                var count = {
+                        skip: 0,
+                        overwrite: 0,
+                        keep: 0
+                    },
+                    names = (one ? '"' + fmCopy.conflicts[0].name + '" already exists there' : n + ' items already exist there: ' + fmCopy.conflicts.slice(0, 4).map(function(c) {
+                        return c.name + (c.dir ? '/' : '');
+                    }).join(', ') + (n > 4 ? ' and ' + (n - 4) + ' more' : '')) + '. ',
+                    said = {
+                        skip: 'not be ' + (move ? 'moved' : 'copied'),
+                        overwrite: 'be replaced',
+                        keep: 'be saved under a new name'
+                    };
+                fmCopy.conflicts.forEach(function(c) {
+                    count[fm_copy_item_mode(c)]++;
+                });
+                var used = ['overwrite', 'keep', 'skip'].filter(function(m) {
+                    return count[m];
+                });
+                if (used.length === 1) return names + (one ? 'It' : 'They') + ' will ' + said[used[0]] + '.';
+                return names + used.map(function(m) {
+                    return count[m] + ' will ' + said[m];
+                }).join(', ') + '.';
+            }
+
+            // Send each item's own choice along, in the same order as file[]
+            $(document).on('submit', '#js-copy-form', function() {
+                $('#js-copy-inputs input[name="conflict_each[]"]').remove();
+                fmCopy.names.forEach(function(n) {
+                    var hit = fmCopy.conflicts.filter(function(c) {
+                        return c.name === n;
+                    })[0];
+                    $('<input type="hidden" name="conflict_each[]">').val(hit ? fm_copy_item_mode(hit) : ($('input[name="conflict"]:checked').val() || 'skip')).appendTo('#js-copy-inputs');
+                });
+            });
+
             function fm_copy_load(path) {
                 fmCopy.dest = path;
                 $('#js-copy-to').val(path);
                 fm_copy_crumbs(path);
-                fm_copy_validate();
+                fm_copy_conflicts(path);
                 var $list = $('#js-dest-list').html('<li class="fm-dest-state"><i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Loading folders…</li>');
                 $.post(window.location, {
                     ajax: true,
@@ -19197,11 +22351,20 @@ function fm_show_header_login()
                         if (dest === item || dest.indexOf(item + '/') === 0) problem = 'A folder can\'t be placed inside itself. Pick a folder outside "' + n + '".';
                     });
                 }
-                $('#js-dest-note').toggleClass('is-problem', !!problem).html(problem ? '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + fm_esc(problem) : '<i class="fa fa-check-circle" aria-hidden="true"></i> ' + ($('#js-mode-move').is(':checked') ? 'Move to ' : 'Copy to ') + '<strong>' + fm_esc(full) + '</strong>');
+                var clash = problem ? '' : fm_copy_conflict_hint();
+                if (problem) {
+                    $('#js-conflict-count').prop('hidden', true);
+                    $('#js-copy-items li').removeClass('is-conflict').find('.fm-copy-exists').remove();
+                }
+                $('#js-dest-note').toggleClass('is-problem', !!(problem || clash)).html(problem ? '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + fm_esc(problem) : '<i class="fa ' + (clash ? 'fa-exclamation-triangle' : (fmCopy.checking ? 'fa-circle-o-notch fa-spin' : 'fa-check-circle')) + '" aria-hidden="true"></i> <span>' + ($('#js-mode-move').is(':checked') ? 'Move to ' : 'Copy to ') + '<strong>' + fm_esc(full) + '</strong>' + (clash ? '<br>' + fm_esc(clash) : '') + '</span>');
                 $('#js-copy-submit').prop('disabled', !!problem);
             }
 
             $(document).on('change', 'input[name="fm_copy_mode"]', fm_copy_mode);
+            $(document).on('change', 'input[name="conflict"]', function() {
+                fmCopy.choice = {}; // one choice for all again
+                fm_copy_validate();
+            });
 
             // New item modal: type switch, name checks, focus
             function fm_new_item_check() {
@@ -19451,7 +22614,7 @@ function fm_show_header_login()
                 var editor = ace.edit("editor");
                 editor.getSession().setMode({
                     path: <?php echo json_encode('ace/mode/' . $ext); ?>,
-                    // full-file mode: a normal "<?php" opening tag must not show as an error
+                    // full-file mode: a normal PHP opening tag must not show as an error (never write the tag itself here: with short_open_tag=On it would start PHP code)
                     inline: false
                 });
                 // editor colours follow the app theme
