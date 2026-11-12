@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.5
+ * Tiny File Manager++ 1.0.6
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.5');
+define('VERSION', '1.0.6');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -6425,11 +6425,132 @@ function fm_update_source()
  * GET from GitHub only: https, known hosts on every redirect hop, a size limit
  * @return array [http code, body, error message]
  */
+/**
+ * One HTTP GET without curl: a stream socket (TLS with full certificate checks unless $verify is false),
+ * or PHP's http(s) wrapper when sockets are disabled and allow_url_fopen is on. Never follows redirects.
+ * $connect: connect to this address instead of the URL's host (the self-test talks to this server by address).
+ * @return array [http code, headers (lower-case name => value), body, error]
+ */
+function fm_http_get($url, $headers, $max, $verify = true, $connect = '')
+{
+    $u = parse_url((string) $url);
+    if (!$u || empty($u['host']) || !in_array(strtolower(isset($u['scheme']) ? $u['scheme'] : ''), array('http', 'https'), true)) return array(0, array(), '', 'bad address');
+    $https = strtolower($u['scheme']) === 'https';
+    $port = isset($u['port']) ? (int) $u['port'] : ($https ? 443 : 80);
+    $host = $u['host'];
+    $target = (isset($u['path']) && $u['path'] !== '' ? $u['path'] : '/') . (isset($u['query']) ? '?' . $u['query'] : '');
+    $hdr = array('Host' => $host . ((!$https && $port !== 80) || ($https && $port !== 443) ? ':' . $port : ''), 'User-Agent' => 'TinyFileManagerPlusPlus/' . VERSION, 'Connection' => 'close');
+    foreach ($headers as $h) {
+        if (preg_match('/^([\w-]+):\s*(.*)$/', $h, $m)) $hdr[$m[1]] = preg_replace('/[\r\n]/', '', $m[2]);
+    }
+    $ssl = array('verify_peer' => $verify, 'verify_peer_name' => $verify, 'allow_self_signed' => !$verify, 'peer_name' => trim($hdr['Host'] !== '' ? preg_replace('/:\d+$/', '', $hdr['Host']) : $host, '[]'), 'SNI_enabled' => true);
+    $raw = '';
+    $too_big = false;
+    if (function_exists('stream_socket_client') && !fm_fn_disabled('stream_socket_client')) {
+        $addr = $connect !== '' ? $connect : $host;
+        if (strpos($addr, ':') !== false && $addr[0] !== '[') $addr = '[' . $addr . ']';
+        $ctx = stream_context_create(array('ssl' => $ssl));
+        $fh = @stream_socket_client(($https ? 'tls://' : 'tcp://') . $addr . ':' . $port, $en, $es, 8, STREAM_CLIENT_CONNECT, $ctx);
+        if (!$fh) return array(0, array(), '', trim($es) !== '' ? trim($es) : 'the connection failed');
+        stream_set_timeout($fh, 60);
+        $req = 'GET ' . $target . " HTTP/1.0\r\n";
+        foreach ($hdr as $k => $v) $req .= $k . ': ' . $v . "\r\n";
+        fwrite($fh, $req . "\r\n");
+        while (!feof($fh)) {
+            $chunk = fread($fh, 65536);
+            if ($chunk === false) break;
+            $raw .= $chunk;
+            if (strlen($raw) > $max + 65536) {
+                $too_big = true;
+                break;
+            }
+            $meta = stream_get_meta_data($fh);
+            if (!empty($meta['timed_out'])) return array(0, array(), '', 'the server took too long');
+        }
+        fclose($fh);
+        $pos = strpos($raw, "\r\n\r\n");
+        if ($pos === false) return array(0, array(), '', 'no answer');
+        $head = explode("\r\n", substr($raw, 0, $pos));
+        $body = (string) substr($raw, $pos + 4);
+    } elseif (ini_get('allow_url_fopen') && in_array($https ? 'https' : 'http', stream_get_wrappers(), true)) {
+        $hs = '';
+        // the URL already names the address to connect to; a Host header is only sent for the self-test
+        foreach ($hdr as $k => $v) if (($k !== 'Host' || $connect !== '') && $k !== 'Connection') $hs .= $k . ': ' . $v . "\r\n";
+        $ctx = stream_context_create(array('http' => array('method' => 'GET', 'header' => $hs, 'follow_location' => 0, 'max_redirects' => 1, 'ignore_errors' => true, 'timeout' => 60, 'protocol_version' => 1.0), 'ssl' => $ssl));
+        $fh = @fopen($url, 'rb', false, $ctx);
+        if (!$fh) return array(0, array(), '', 'the connection failed');
+        $body = '';
+        while (!feof($fh)) {
+            $chunk = fread($fh, 65536);
+            if ($chunk === false) break;
+            $body .= $chunk;
+            if (strlen($body) > $max) {
+                $too_big = true;
+                break;
+            }
+        }
+        $meta = stream_get_meta_data($fh);
+        fclose($fh);
+        $head = isset($meta['wrapper_data']) ? (array) $meta['wrapper_data'] : array();
+    } else {
+        return array(0, array(), '', 'this server has neither the PHP curl extension nor stream sockets / allow_url_fopen for HTTPS');
+    }
+    if ($too_big) return array(0, array(), '', 'the download was larger than expected');
+    $code = isset($head[0]) && preg_match('#^HTTP/\S+\s+(\d{3})#', $head[0], $m) ? (int) $m[1] : 0;
+    $out = array();
+    foreach (array_slice($head, 1) as $l) {
+        if (preg_match('/^([\w-]+):\s*(.*)$/', $l, $m)) $out[strtolower($m[1])] = trim($m[2]);
+    }
+    if (isset($out['transfer-encoding']) && stripos($out['transfer-encoding'], 'chunked') !== false) {
+        // an HTTP/1.1 answer to our 1.0 request (some proxies): undo the chunking
+        $plain = '';
+        for ($i = 0; $i < strlen($body);) {
+            $nl = strpos($body, "\r\n", $i);
+            if ($nl === false) break;
+            $len = hexdec(trim(substr($body, $i, $nl - $i)));
+            if ($len <= 0) break;
+            $plain .= substr($body, $nl + 2, $len);
+            $i = $nl + 2 + $len + 2;
+        }
+        $body = $plain;
+    }
+    if ($code === 0) return array(0, $out, '', 'no answer');
+    return array($code, $out, $body, '');
+}
+
+/** Can this server fetch the update without curl? */
+function fm_update_can_fetch()
+{
+    if (function_exists('curl_init') && !fm_fn_disabled('curl_exec')) return 'curl';
+    if (function_exists('stream_socket_client') && !fm_fn_disabled('stream_socket_client') && extension_loaded('openssl')) return 'sockets';
+    if (ini_get('allow_url_fopen') && in_array('https', stream_get_wrappers(), true)) return 'fopen';
+    return '';
+}
+
 function fm_update_http($url, $max = 10485760)
 {
-    if (!function_exists('curl_init')) return array(0, '', 'the PHP curl extension is missing');
-    if (fm_fn_disabled('curl_exec')) return array(0, '', 'curl_exec is in disable_functions on this server');
     $src = fm_update_source();
+    if (!function_exists('curl_init') || fm_fn_disabled('curl_exec')) {
+        // no curl: the same rules (known hosts on every hop, https, size limit) over PHP's own streams
+        if (fm_update_can_fetch() === '') return array(0, '', 'this server has neither the PHP curl extension nor another way to make HTTPS requests (stream sockets with openssl, or allow_url_fopen)');
+        for ($hop = 0; $hop < 6; $hop++) {
+            $u = parse_url((string) $url);
+            if (!$u || empty($u['scheme']) || strtolower($u['scheme']) !== $src['scheme'] || empty($u['host'])
+                || !in_array(strtolower($u['host']), $src['hosts'], true) || isset($u['user']) || isset($u['pass'])) {
+                return array(0, '', 'a download from ' . (isset($u['host']) ? $u['host'] : 'an unknown address') . ' was refused');
+            }
+            list($code, $h, $body, $err) = fm_http_get($url, array('Accept: ' . (strtolower($u['host']) === 'api.github.com' ? 'application/vnd.github+json' : 'application/octet-stream')), $max);
+            if ($err !== '') return array(0, '', 'GitHub could not be reached (' . $err . ')');
+            if ($code >= 300 && $code < 400 && !empty($h['location'])) {
+                $next = $h['location'];
+                if ($next[0] === '/') $next = $u['scheme'] . '://' . $u['host'] . (isset($u['port']) ? ':' . $u['port'] : '') . $next;
+                $url = $next;
+                continue;
+            }
+            return array($code, $body, $code === 200 ? '' : 'GitHub answered with HTTP ' . $code);
+        }
+        return array(0, '', 'too many redirects');
+    }
     for ($hop = 0; $hop < 6; $hop++) {
         $u = parse_url((string) $url);
         if (!$u || empty($u['scheme']) || strtolower($u['scheme']) !== $src['scheme'] || empty($u['host'])
@@ -6629,6 +6750,17 @@ function fm_update_selftest($want)
     $port = !empty($_SERVER['SERVER_PORT']) ? (int) $_SERVER['SERVER_PORT'] : ($https ? 443 : 80);
     $path = !empty($_SERVER['SCRIPT_NAME']) ? (string) $_SERVER['SCRIPT_NAME'] : '/' . basename(__FILE__);
     $host = preg_replace('/[^A-Za-z0-9.:\[\]-]/', '', isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : 'localhost');
+    if (!function_exists('curl_init') || fm_fn_disabled('curl_exec')) {
+        // no curl: ask this server over a socket, by address, with the site's host name (this server: no certificate check)
+        list($code, $h, $body, $err) = fm_http_get(($https ? 'https' : 'http') . '://' . trim($addr, '[]') . ':' . $port . $path . '?fm_update_ping=' . $nonce, array('Host: ' . $host), 65536, false, trim($addr, '[]'));
+        @unlink($nf);
+        if ($err !== '') return 'the self-test could not reach this web server (' . $err . ')';
+        if ($code !== 200 || trim((string) $body) !== 'tfmpp-ok ' . $want) {
+            $said = trim(preg_replace('/\s+/', ' ', strip_tags((string) $body)));
+            return 'the new version did not start correctly (HTTP ' . $code . ($said !== '' ? ': ' . substr($said, 0, 160) : '') . ')';
+        }
+        return '';
+    }
     $ch = curl_init(($https ? 'https' : 'http') . '://' . $addr . ':' . $port . $path . '?fm_update_ping=' . $nonce);
     curl_setopt_array($ch, array(
         CURLOPT_RETURNTRANSFER => true,
@@ -7851,7 +7983,7 @@ function fm_setup_checks()
         'json' => array('fail', 'Settings, uploads and every dialog', 'The app exchanges all its data as JSON.'),
         'zip' => array('warn', 'Zip download, Zip archives and Extract', 'Downloading several items, making .zip files and unpacking them are switched off.'),
         'phar' => array('warn', 'Tar archives', '.tar archives can\'t be made or unpacked.'),
-        'curl' => array('warn', 'Upload from URL and updates', 'Uploading from a web address and Check for updates can\'t work.'),
+        'curl' => array('warn', fm_update_can_fetch() !== '' ? 'Upload from URL' : 'Upload from URL and updates', fm_update_can_fetch() !== '' ? 'Uploading from a web address can\'t work (updates use PHP\'s own HTTPS instead).' : 'Uploading from a web address and Check for updates can\'t work.'),
         'mbstring' => array('warn', 'Non-English file names', 'Names with accents or non-Latin letters may be cut or shown wrongly.'),
         'fileinfo' => array('warn', 'File types', 'File types are guessed from the extension only; previews may pick the wrong viewer.'),
         'iconv' => array('warn', 'File name encodings', 'Converting file names from other encodings is off.'),
@@ -7860,7 +7992,10 @@ function fm_setup_checks()
         'Zend OPcache' => array('info', 'Speed', 'Without OPcache every page compiles the whole app again (slower, more CPU).'),
     ) as $ext => $d) {
         $name = $ext === 'Zend OPcache' ? 'opcache' : $ext;
-        if (extension_loaded($ext)) $add($g, 'Extension ' . $name, 'ok', 'loaded', $d[1] . ' work.');
+        // curl loaded but its functions switched off counts as missing
+        $off = $ext === 'curl' && extension_loaded('curl') && (!function_exists('curl_init') || fm_fn_disabled('curl_init') || fm_fn_disabled('curl_exec'));
+        if (extension_loaded($ext) && !$off) $add($g, 'Extension ' . $name, 'ok', 'loaded', $d[1] . ' work.');
+        elseif ($off) $add($g, 'Extension ' . $name, $d[0], 'functions disabled', $d[1] . ': ' . $d[2], 'curl is installed, but curl_init / curl_exec are in disable_functions. Remove them there (see "Disabled functions" below), then restart PHP.');
         else $add($g, 'Extension ' . $name, $d[0], 'missing', $d[1] . ': ' . $d[2], 'Install the extension, then restart PHP.', $install($name));
     }
 

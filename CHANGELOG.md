@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.6 — updates without curl
+
+- **Check for updates and Update now work without the PHP curl extension.** When curl is missing or switched off,
+  the updater talks to GitHub over PHP's own stream sockets (TLS with full certificate checks), or PHP's https
+  wrapper when sockets are disabled and `allow_url_fopen` is on. The same rules apply on every route: GitHub hosts
+  only, every redirect checked, size limit, SHA-256 and version check, self-test with automatic roll back.
+  Upload from URL still needs curl (its address pinning depends on it).
+- Setup check: curl that is installed but has `curl_init` / `curl_exec` in `disable_functions` now shows as
+  "functions disabled", and its description says what still works.
+
 ## 1.0.5 — settings export / import, clearer copy/move results
 
 - **Settings › Export / Import.** Export downloads every setting and user (with password hashes) as a .json file.
