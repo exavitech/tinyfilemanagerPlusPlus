@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.0.5 — settings export / import, clearer copy/move results
+
+- **Settings › Export / Import.** Export downloads every setting and user (with password hashes) as a .json file.
+  Import shows what would change before anything happens, then asks for your password. Every value is checked like
+  on the Settings page; values that don't fit the server keep their current value, a user whose own folder doesn't
+  exist is skipped (never turned into an administrator), sign-in can't be switched off and address rules that would
+  block you are refused. The current settings are saved first (the last three backups are kept, owner-only, hidden).
+- **Copy / move keeps the app's own files.** Copying a backup of the app over the running one no longer reports
+  "protected" errors: settings.php, the error log and caches of the running file manager are kept (also when they
+  don't exist yet, so a copied settings.php can't bypass Import's checks), the dialog says so before you start, and
+  the result is a note, not an error.
+- Items hidden by the settings are reported as "kept" in the same way.
+- **Security: links can't lead out of a user's folder.** For everyone but administrators, the root folder is now a
+  hard boundary: a symbolic link that points outside it (or a path through one) can't be browsed, opened, downloaded,
+  edited, written to, copied, moved, uploaded into or searched, and archives leave such links out. The file list shows
+  "outside your folder" instead of the link's target. (Users could not create such links themselves; this closes it for
+  links placed by someone with shell access, as in the original Tiny File Manager.)
+
 ## 1.0.4 — copy/move conflicts, updates, setup check, error log
 
 ### Copy and move

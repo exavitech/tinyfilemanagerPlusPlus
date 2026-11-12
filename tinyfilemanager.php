@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.4
+ * Tiny File Manager++ 1.0.5
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.4');
+define('VERSION', '1.0.5');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -175,6 +175,87 @@ function fm_errlog_unread()
         if ($n >= 99) break;
     }
     return $n;
+}
+
+/**
+ * Is this one of the running file manager's own files? Its settings and passwords (hashes), error log, caches,
+ * update backup and import backups: never listed, opened, downloaded, replaced or deleted through the app.
+ */
+function fm_own_file($path)
+{
+    $p = strtolower(rtrim(str_replace('\\', '/', (string) $path), '/'));
+    foreach (array('settings_file', 'passwords_file') as $g) {
+        if (!empty($GLOBALS[$g]) && $p === strtolower(str_replace('\\', '/', $GLOBALS[$g]))) return true;
+    }
+    $sdir = strtolower(str_replace('\\', '/', dirname(isset($GLOBALS['settings_file']) ? $GLOBALS['settings_file'] : __FILE__)));
+    $self = strtolower(str_replace('\\', '/', __FILE__));
+    if (in_array($p, array($sdir . '/.tfmpp-update.json', $sdir . '/.tfmpp-ping', $sdir . '/tfmpp-errors.php', $sdir . '/tfmpp-errors.1.php', $sdir . '/.tfmpp-errors-seen'), true)) return true;
+    if (dirname($p) === $sdir && fnmatch('settings.before-import-*.php', basename($p))) return true;
+    if (strpos($p, $self . '.') === 0 && substr($p, -4) === '.bak') return true; // the version kept by the updater
+    if (strpos($p, dirname($self) . '/.' . basename($self) . '.update-') === 0) return true; // a half-written update
+    return false;
+}
+
+/** "/a/b/../c/./d" -> "/a/c/d" (text only, for link targets that don't exist) */
+function fm_norm_path($p)
+{
+    $out = array();
+    foreach (explode('/', str_replace('\\', '/', $p)) as $part) {
+        if ($part === '' || $part === '.') continue;
+        if ($part === '..') array_pop($out);
+        else $out[] = $part;
+    }
+    return '/' . implode('/', $out);
+}
+
+/**
+ * Does this path (absolute) lead outside the root folder, through a symbolic link anywhere on the way?
+ * Existing paths are resolved with realpath; for a name that doesn't exist yet its nearest existing parent counts;
+ * a link that points nowhere is judged by where it points. Used for everyone who is not an administrator:
+ * their root folder is the boundary, links included. (Administrators may change the root folder anyway.)
+ */
+function fm_path_escapes($abs)
+{
+    static $root = null;
+    if ($root === null) {
+        $r = realpath(FM_ROOT_PATH);
+        $root = $r === false ? false : rtrim(str_replace('\\', '/', $r), '/');
+    }
+    if ($root === false) return true;
+    if ($root === '') return false; // the root folder is "/": nothing is outside
+    $p = rtrim(str_replace('\\', '/', (string) $abs), '/');
+    $real = false;
+    for ($i = 0; $i < 256 && $p !== '' && $real === false; $i++) {
+        if (is_link($p)) {
+            $t = @readlink($p);
+            if ($t === false || $t === '') return true;
+            if ($t[0] !== '/') $t = dirname($p) . '/' . $t;
+            $real = realpath($t);
+            if ($real === false) $real = fm_norm_path($t); // points nowhere (yet): judge the target itself
+        } elseif (file_exists($p)) {
+            $real = realpath($p);
+        } else {
+            $up = dirname($p);
+            if ($up === $p) break;
+            $p = $up;
+        }
+    }
+    if ($real === false) return true;
+    $real = rtrim(str_replace('\\', '/', $real), '/');
+    return !($real === $root || strpos($real . '/', $root . '/') === 0);
+}
+
+/** Where a link points, for the file list: the target for administrators; others only learn that it leads outside their folder */
+function fm_link_label($abs)
+{
+    if ((defined('FM_CAN_CONFIGURE') && FM_CAN_CONFIGURE) || !fm_path_escapes($abs)) return fm_enc((string) @readlink($abs));
+    return '<em>outside your folder</em>';
+}
+
+/** For folder walkers (zip, tar): may this entry be read? Links that lead outside the root are left out for non-administrators. */
+function fm_link_inside($abs)
+{
+    return !is_link($abs) || (defined('FM_CAN_CONFIGURE') && FM_CAN_CONFIGURE) || !fm_path_escapes($abs);
 }
 
 /** Is this PHP function switched off in disable_functions? (function_exists() is true for the stand-ins above) */
@@ -798,6 +879,41 @@ if (!$fm_settings_req) {
             if (fm_path_hidden(fm_clean_path($v))) $hidden_hit = true;
         }
     }
+    // links: for everyone but administrators, nothing may lead outside the root folder (browse, open, write, archive)
+    $escape_hit = false;
+    if (!FM_CAN_CONFIGURE) {
+        $base = rtrim(FM_ROOT_PATH, '/');
+        $names = $in_folder;
+        foreach (array('newfilename', 'rename_to') as $k) {
+            if (isset($_POST[$k]) && is_string($_POST[$k])) $names[] = $_POST[$k];
+        }
+        if (isset($_REQUEST['fullpath']) && is_string($_REQUEST['fullpath'])) $names[] = $_REQUEST['fullpath']; // upload into subfolders
+        $check = array(FM_PATH);
+        foreach ($names as $n) {
+            if (is_string($n)) foreach (array_unique(array($n, urldecode($n))) as $v) $check[] = FM_PATH . '/' . fm_clean_path($v);
+        }
+        foreach ($from_root as $n) {
+            if (is_string($n)) foreach (array_unique(array($n, urldecode($n))) as $v) $check[] = fm_clean_path($v);
+        }
+        foreach ($check as $rel) {
+            if (fm_path_escapes($base . '/' . trim($rel, '/'))) {
+                $escape_hit = true;
+                break;
+            }
+        }
+    }
+    if ($escape_hit && !$hidden_hit) {
+        fm_errlog('action', 'A link leading outside the user\'s folder was refused', FM_PATH, 'warning', 300);
+        if (isset($_POST['ajax']) || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')) {
+            header('HTTP/1.0 403 Forbidden');
+            header('Content-Type: text/plain; charset=utf-8');
+            die('That item is a link to a place outside your folder.');
+        }
+        fm_set_msg('That item is a link to a place outside your folder, so it can\'t be opened or changed here.', 'alert');
+        $up = FM_PATH;
+        while ($up !== '' && fm_path_escapes(rtrim(FM_ROOT_PATH, '/') . '/' . $up)) $up = (string) fm_get_parent_path($up);
+        fm_redirect(FM_SELF_URL . '?p=' . urlencode($up));
+    }
     if ($hidden_hit) {
         if (isset($_POST['ajax']) || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')) {
             header('HTTP/1.0 403 Forbidden');
@@ -809,7 +925,7 @@ if (!$fm_settings_req) {
         while ($up !== '' && fm_path_hidden($up)) $up = (string) fm_get_parent_path($up);
         fm_redirect(FM_SELF_URL . '?p=' . urlencode($up));
     }
-    unset($hidden_hit, $in_folder, $from_root, $n, $v, $k, $up);
+    unset($hidden_hit, $escape_hit, $in_folder, $from_root, $names, $check, $base, $rel, $n, $v, $k, $up);
 }
 
 /*************************** ACTIONS ***************************/
@@ -956,6 +1072,24 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
         exit;
     }
 
+    // Settings › Import: preview what a settings file would change, then apply it after the admin's password
+    if (isset($_POST['type']) && $_POST['type'] === 'settings_import') {
+        header('Content-Type: application/json; charset=utf-8');
+        if (!FM_CAN_CONFIGURE) {
+            echo json_encode(array('ok' => false, 'message' => 'Only administrators can import settings.'));
+            exit;
+        }
+        $f = isset($_FILES['file']) ? $_FILES['file'] : null;
+        if (!$f || $f['error'] !== UPLOAD_ERR_OK || $f['size'] > 1048576) {
+            echo json_encode(array('ok' => false, 'message' => $f && $f['size'] > 1048576 ? 'That file is too large to be a settings file.' : 'The file did not arrive. Choose it again.'));
+            exit;
+        }
+        $r = fm_settings_import((string) file_get_contents($f['tmp_name']), !empty($_POST['apply']), isset($_POST['password']) ? (string) $_POST['password'] : '');
+        if (!empty($_POST['apply']) && empty($r['ok'])) fm_errlog('action', 'Settings import refused: ' . $r['message'], '', 'warning');
+        echo json_encode($r);
+        exit;
+    }
+
     // Updates (account menu > Check for updates): admins only, from this fork's GitHub Releases
     if (isset($_POST['type']) && in_array($_POST['type'], array('update_check', 'update_install', 'update_rollback'), true)) {
         header('Content-Type: application/json; charset=utf-8');
@@ -1019,8 +1153,11 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 $n = basename(fm_clean_path($n));
                 if ($n === '' || $n === '.' || $n === '..') continue;
                 $full = rtrim($abs, '/') . '/' . $n;
-                // items hidden by the settings are never reported (the server refuses to overwrite them)
-                if ((file_exists($full) || is_link($full)) && !fm_path_hidden(trim($dir . '/' . $n, '/'))) {
+                if (fm_own_file($full)) {
+                    // the running app's own files: always kept (the dialog says so before anything happens)
+                    $out[] = array('name' => fm_convert_win($n), 'dir' => is_dir($full), 'kept' => true);
+                } elseif ((file_exists($full) || is_link($full)) && !fm_path_hidden(trim($dir . '/' . $n, '/'))) {
+                    // items hidden by the settings are never reported
                     $out[] = array('name' => fm_convert_win($n), 'dir' => is_dir($full));
                 }
             }
@@ -2528,6 +2665,22 @@ if (isset($_GET['copy']) && !isset($_GET['finish']) && !FM_READONLY) {
     exit;
 }
 
+// Settings › Export: every setting and user (with password hashes) as a .json file (admins, POST + token)
+if (isset($_POST['settings_export']) && FM_CAN_CONFIGURE) {
+    if (!isset($_POST['token']) || !verifyToken($_POST['token'])) {
+        fm_set_msg(lng('This page had expired, so nothing was changed. Please try again.'), 'alert');
+        fm_redirect(FM_SELF_URL . '?p=' . urlencode(FM_PATH) . '&settings=1');
+    }
+    $host = preg_replace('/[^A-Za-z0-9.-]/', '', preg_replace('/:\d+$/', '', isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : 'server'));
+    $data = array('format' => 'tfmpp-settings', 'format_version' => 1, 'app' => VERSION, 'exported' => date('c'), 'host' => $host,
+        'note' => 'Contains the password hashes of every user. Keep this file private.', 'settings' => $fm_saved['settings'], 'users' => fm_users_effective());
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Disposition: attachment; filename="tfmpp-settings-' . ($host ?: 'server') . '-' . date('Ymd-His') . '.json"');
+    header('Cache-Control: no-store');
+    echo json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 if (isset($_GET['settings']) && FM_CAN_CONFIGURE) {
     fm_show_header(); // HEADER
     fm_show_nav_path(FM_PATH); // current path
@@ -2629,7 +2782,126 @@ if (isset($_GET['settings']) && FM_CAN_CONFIGURE) {
             <div>
                 <h1><?php echo lng('Settings') ?></h1>
             </div>
+            <div class="fm-env-head-actions">
+                <form method="post" action="?p=<?php echo urlencode(FM_PATH) ?>&amp;settings=1" class="fm-inline-form">
+                    <input type="hidden" name="token" value="<?php echo $_SESSION['token']; ?>">
+                    <input type="hidden" name="settings_export" value="1">
+                    <button type="submit" class="btn btn-outline-secondary btn-sm" title="Download every setting and user as a .json file (it contains the password hashes: keep it private)"><i class="fa fa-download" aria-hidden="true"></i> Export</button>
+                </form>
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="fm-imp-open" title="Bring back settings and users from an exported file"><i class="fa fa-upload" aria-hidden="true"></i> Import</button>
+            </div>
         </div>
+
+        <div class="modal fade" id="fm-imp-modal" tabindex="-1" aria-labelledby="fm-imp-title" aria-hidden="true" data-bs-theme="<?php echo FM_THEME; ?>">
+            <div class="modal-dialog modal-dialog-centered modal-lg">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="fm-imp-title"><i class="fa fa-upload" aria-hidden="true"></i> Import settings</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <label class="fm-imp-drop" for="fm-imp-file">
+                            <i class="fa fa-file-code-o" aria-hidden="true"></i>
+                            <span><strong id="fm-imp-name">Choose a settings file</strong><small>A .json file made with Export, on this or another server. It replaces settings and users.</small></span>
+                            <input type="file" id="fm-imp-file" accept=".json,application/json">
+                        </label>
+                        <div id="fm-imp-preview" hidden>
+                            <p class="fm-imp-from" id="fm-imp-from"></p>
+                            <div class="fm-imp-grid">
+                                <section><h6>Settings that change <span class="fm-copy-count" id="fm-imp-nchg"></span></h6><ul class="fm-imp-list" id="fm-imp-changes"></ul></section>
+                                <section><h6>Users</h6><ul class="fm-imp-list" id="fm-imp-users"></ul></section>
+                            </div>
+                            <ul class="fm-imp-warn" id="fm-imp-warn" hidden></ul>
+                            <p class="fm-imp-signout" id="fm-imp-signout" hidden><i class="fa fa-sign-out" aria-hidden="true"></i> Your own account is different in the file: you will be signed out and must sign in with an account from the file.</p>
+                            <?php if (FM_USE_AUTH): ?>
+                            <label class="fm-imp-pwd" for="fm-imp-pwd">Your password, to confirm
+                                <input type="password" class="form-control" id="fm-imp-pwd" autocomplete="current-password">
+                            </label>
+                            <?php endif; ?>
+                        </div>
+                        <p class="fm-imp-status" id="fm-imp-status" role="status" hidden></p>
+                    </div>
+                    <div class="modal-footer">
+                        <span class="fm-imp-note"><i class="fa fa-shield" aria-hidden="true"></i> The current settings are saved first.</span>
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+                        <button type="button" class="btn btn-primary" id="fm-imp-go" disabled><i class="fa fa-check" aria-hidden="true"></i> Import</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script>
+        (function() {
+            var file = null, ready = false;
+            var el = function(id) { return document.getElementById(id); };
+            var esc = function(t) { var d = document.createElement('div'); d.textContent = t; return d.innerHTML; };
+            function status(kind, html) { var s = el('fm-imp-status'); s.hidden = !kind; s.className = 'fm-imp-status' + (kind ? ' is-' + kind : ''); s.innerHTML = html || ''; }
+            function send(apply) {
+                var fd = new FormData();
+                fd.append('ajax', 'true');
+                fd.append('type', 'settings_import');
+                fd.append('token', window.csrf);
+                fd.append('file', file);
+                if (apply) { fd.append('apply', '1'); if (el('fm-imp-pwd')) fd.append('password', el('fm-imp-pwd').value); }
+                return fetch(location.pathname + '?p=', {method: 'POST', body: fd, credentials: 'same-origin'}).then(function(r) { return r.json(); });
+            }
+            function check() {
+                el('fm-imp-go').disabled = !ready || (el('fm-imp-pwd') && !el('fm-imp-pwd').value);
+            }
+            el('fm-imp-open').addEventListener('click', function() {
+                file = null; ready = false;
+                el('fm-imp-file').value = '';
+                el('fm-imp-name').textContent = 'Choose a settings file';
+                el('fm-imp-preview').hidden = true;
+                if (el('fm-imp-pwd')) el('fm-imp-pwd').value = '';
+                status('');
+                check();
+                bootstrap.Modal.getOrCreateInstance(el('fm-imp-modal')).show();
+            });
+            el('fm-imp-file').addEventListener('change', function() {
+                file = this.files[0] || null;
+                ready = false;
+                check();
+                if (!file) return;
+                el('fm-imp-name').textContent = file.name;
+                status('busy', '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Reading the file…');
+                send(false).then(function(d) {
+                    if (!d.ok) { el('fm-imp-preview').hidden = true; status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + esc(d.message)); return; }
+                    el('fm-imp-from').textContent = 'From ' + d.from + '. ' + d.message;
+                    el('fm-imp-nchg').textContent = d.changes.length;
+                    el('fm-imp-changes').innerHTML = d.changes.length ? d.changes.map(function(c) {
+                        return '<li><strong>' + esc(c.label) + '</strong><span>' + esc(c.from) + ' <i class="fa fa-long-arrow-right" aria-hidden="true"></i> ' + esc(c.to) + '</span></li>';
+                    }).join('') : '<li class="fm-imp-none">No changes</li>';
+                    var u = d.users, rows = [];
+                    u.added.forEach(function(n) { rows.push('<li><span class="fm-env-badge is-ok">added</span> ' + esc(n) + '</li>'); });
+                    u.changed.forEach(function(n) { rows.push('<li><span class="fm-env-badge is-warn">changed</span> ' + esc(n) + '</li>'); });
+                    u.removed.forEach(function(n) { rows.push('<li><span class="fm-env-badge is-bad">removed</span> ' + esc(n) + '</li>'); });
+                    el('fm-imp-users').innerHTML = rows.join('') || '<li class="fm-imp-none">No changes</li>';
+                    el('fm-imp-warn').hidden = !d.warnings.length;
+                    el('fm-imp-warn').innerHTML = d.warnings.map(function(w) { return '<li><i class="fa fa-exclamation-triangle" aria-hidden="true"></i> ' + esc(w) + '</li>'; }).join('');
+                    el('fm-imp-signout').hidden = !d.signout;
+                    el('fm-imp-preview').hidden = false;
+                    status('');
+                    ready = true;
+                    check();
+                    if (el('fm-imp-pwd')) el('fm-imp-pwd').focus();
+                }).catch(function() { status('error', 'The file could not be checked. Reload the page and try again.'); });
+            });
+            if (el('fm-imp-pwd')) el('fm-imp-pwd').addEventListener('input', check);
+            el('fm-imp-go').addEventListener('click', function() {
+                el('fm-imp-go').disabled = true;
+                status('busy', '<i class="fa fa-circle-o-notch fa-spin" aria-hidden="true"></i> Importing…');
+                send(true).then(function(d) {
+                    if (d.ok && d.done) {
+                        status('ok', '<i class="fa fa-check-circle" aria-hidden="true"></i> ' + esc(d.message) + ' Reloading…');
+                        setTimeout(function() { location.reload(); }, 2200);
+                        return;
+                    }
+                    status('error', '<i class="fa fa-exclamation-circle" aria-hidden="true"></i> ' + esc(d.message));
+                    check();
+                }).catch(function() { status('error', 'The import did not finish. Reload the page to see what is set now.'); check(); });
+            });
+        })();
+        </script>
 
         <form class="card fm-set" id="fm-set" data-bs-theme="<?php echo FM_THEME; ?>" onsubmit="return false" novalidate autocomplete="off">
             <nav class="fm-set-nav" aria-label="Settings sections">
@@ -5658,7 +5930,7 @@ $all_files_size = 0;
                     <td data-sort="<?php echo fm_convert_win(fm_enc($f)) ?>">
                         <div class="filename">
                             <a href="?p=<?php echo urlencode(trim(FM_PATH . '/' . $f, '/')) ?>" title="<?php echo fm_enc($f) ?>"><?php echo fm_get_folder_badge($is_link) ?><span class="fm-fname"><?php echo fm_convert_win(fm_enc($f)) ?></span></a>
-                            <?php echo ($is_link ? '<span class="fm-link-target">&rarr; ' . fm_enc(readlink($path . '/' . $f)) . '</span>' : '') ?>
+                            <?php echo ($is_link ? '<span class="fm-link-target">&rarr; ' . fm_link_label($path . '/' . $f) . '</span>' : '') ?>
                         </div>
                     </td>
                     <td class="fm-col-size" data-order="a-<?php echo str_pad($filesize_raw, 18, "0", STR_PAD_LEFT); ?>"><span class="fm-size-none" title="<?php echo lng('Folder') ?>">&mdash;</span></td>
@@ -5734,7 +6006,7 @@ $all_files_size = 0;
                                     <?php endif; ?>
                                     <?php echo fm_get_file_badge($f) ?><span class="fm-fname"><?php echo fm_convert_win(fm_enc($f)) ?></span>
                                     </a>
-                                    <?php echo ($is_link ? '<span class="fm-link-target">&rarr; ' . fm_enc(readlink($path . '/' . $f)) . '</span>' : '') ?>
+                                    <?php echo ($is_link ? '<span class="fm-link-target">&rarr; ' . fm_link_label($path . '/' . $f) . '</span>' : '') ?>
                         </div>
                     </td>
                     <td class="fm-col-size" data-order="b-<?php echo str_pad($filesize_raw, 18, "0", STR_PAD_LEFT); ?>"><span title="<?php printf('%s bytes', number_format((float) $filesize_raw, 0, '.', ',')) ?>"><?php echo $filesize; ?></span></td>
@@ -6027,6 +6299,11 @@ function fm_place_item($from, $dest_dir, $dest_rel, $move, $conflict)
         return array('status' => 'failed', 'name' => $name, 'why' => 'this file type is not allowed');
     }
     $exists = file_exists($dest) || is_link($dest);
+    if (fm_own_file($dest)) {
+        // settings.php, the error log, caches: they belong to the running file manager and are never written from here
+        // (also when missing: a copied settings.php would skip the checks of Settings › Import)
+        return array('status' => 'kept', 'name' => $name, 'why' => 'own');
+    }
     if ($exists) {
         if ($conflict === 'keep') {
             $free = fm_free_name($dest_dir, $name, is_dir($from) && !is_link($from));
@@ -6036,7 +6313,7 @@ function fm_place_item($from, $dest_dir, $dest_rel, $move, $conflict)
             $exists = false;
         } elseif ($conflict === 'overwrite') {
             if (fm_path_hidden(trim($dest_rel . '/' . $name, '/'))) {
-                return array('status' => 'failed', 'name' => $name, 'why' => 'the item there is protected');
+                return array('status' => 'kept', 'name' => $name, 'why' => 'hidden');
             }
             $from_dir = is_dir($from) && !is_link($from);
             $dest_dir_item = is_dir($dest) && !is_link($dest);
@@ -6087,7 +6364,7 @@ function fm_name_list($names, $max = 10)
  */
 function fm_copy_report($move, $where, $results)
 {
-    $by = array('ok' => array(), 'skipped' => array(), 'renamed' => array(), 'failed' => array());
+    $by = array('ok' => array(), 'skipped' => array(), 'renamed' => array(), 'failed' => array(), 'kept' => array());
     foreach ($results as $r) $by[$r['status']][] = $r;
     $verb = $move ? 'Moved' : 'Copied';
     $base = $move ? 'move' : 'copy';
@@ -6107,13 +6384,22 @@ function fm_copy_report($move, $where, $results)
         $n = count($list);
         $parts[] = sprintf('%s %d %s that already %s in <b>%s</b>: %s. Choose <i>Overwrite</i> or <i>Keep both</i> to %s %s.', $done ? 'Skipped' : 'Nothing was ' . strtolower($verb) . '. Skipped', $n, $n == 1 ? 'item' : 'items', $n == 1 ? 'exists' : 'exist', fm_enc($where), fm_name_list($list), $base, $n == 1 ? 'it' : 'them');
     }
+    if ($by['kept']) {
+        $own = $hid = array();
+        foreach ($by['kept'] as $r) {
+            if ($r['why'] === 'own') $own[] = $r['name'];
+            else $hid[] = $r['name'];
+        }
+        if ($own) $parts[] = sprintf('Kept %s: %s the running file manager\'s own %s (settings, error log or caches), so %s not replaced from here. To bring back settings and users from another copy, use Settings › Import.', fm_name_list($own), count($own) == 1 ? 'it is' : 'they are', count($own) == 1 ? 'file' : 'files', count($own) == 1 ? 'it was' : 'they were');
+        if ($hid) $parts[] = sprintf('Kept %s: hidden by the settings, so not replaced.', fm_name_list($hid));
+    }
     if ($by['failed']) {
         $list = array();
         foreach (array_slice($by['failed'], 0, 10) as $r) $list[] = '<b>' . fm_enc($r['name']) . '</b> (' . fm_enc($r['why']) . ')';
         $more = count($by['failed']) - count($list);
         $parts[] = sprintf('Could not %s: %s%s.', $base, implode(', ', $list), $more > 0 ? sprintf(' and %d more', $more) : '');
     }
-    $type = $by['failed'] ? 'error' : ($by['skipped'] ? 'alert' : 'ok');
+    $type = $by['failed'] ? 'error' : ($by['skipped'] || $by['kept'] ? 'alert' : 'ok');
     fm_set_msg(implode(' ', $parts), $type);
 }
 
@@ -6659,23 +6945,8 @@ function fm_is_exclude_items($name, $path)
     }
     $lname = strtolower($name);
     $lpath = strtolower(rtrim(str_replace('\\', '/', $path), '/'));
-    // the app's own settings.php and passwords.php hold every user's password hash: never shown, opened or downloaded
-    static $own = null;
-    if ($own === null) {
-        $own = array();
-        foreach (array('settings_file', 'passwords_file') as $g) {
-            if (!empty($GLOBALS[$g])) $own[] = strtolower(str_replace('\\', '/', $GLOBALS[$g]));
-        }
-    }
-    if (in_array($lpath, $own, true)) return false;
-    // the updater's files: the kept earlier version, the check cache, the self-test code and a half-written update
-    static $upd = null;
-    if ($upd === null) {
-        $self = strtolower(str_replace('\\', '/', __FILE__));
-        $sdir = strtolower(str_replace('\\', '/', dirname($GLOBALS['settings_file'])));
-        $upd = array($self, dirname($self) . '/.' . basename($self) . '.update-', array($sdir . '/.tfmpp-update.json', $sdir . '/.tfmpp-ping', $sdir . '/tfmpp-errors.php', $sdir . '/tfmpp-errors.1.php', $sdir . '/.tfmpp-errors-seen'));
-    }
-    if ((strpos($lpath, $upd[0] . '.') === 0 && substr($lpath, -4) === '.bak') || strpos($lpath, $upd[1]) === 0 || in_array($lpath, $upd[2], true)) return false;
+    // the app's own files (settings.php and passwords.php hold every password hash): never shown, opened or changed
+    if (fm_own_file($lpath)) return false;
     foreach ($rules as $r) {
         $subject = $r[1] ? $lpath : $lname;
         if ($subject === $r[0] || ($r[2] && fnmatch($r[0], $subject))) {
@@ -9688,6 +9959,149 @@ function fm_settings_save_request($in)
     return array('ok' => true, 'errors' => array(), 'message' => 'Settings saved.');
 }
 
+/**
+ * Read a settings file made by Export and say what importing it would change; with $apply, also write it.
+ * Every value goes through the same checks as the Settings page. What doesn't fit this server keeps its current value.
+ * A user whose own folder doesn't exist here is skipped (importing it without the folder would make it an admin).
+ */
+function fm_settings_import($raw, $apply, $password)
+{
+    global $fm_defaults, $fm_saved, $settings_file;
+    $res = array('ok' => false, 'message' => '', 'from' => '', 'changes' => array(), 'users' => array('added' => array(), 'removed' => array(), 'changed' => array()), 'warnings' => array(), 'signout' => false);
+    $d = json_decode($raw, true);
+    if (!is_array($d) || !isset($d['format']) || $d['format'] !== 'tfmpp-settings' || !isset($d['settings']) || !is_array($d['settings'])) {
+        $res['message'] = 'This is not a settings file exported from Tiny File Manager++.';
+        return $res;
+    }
+    $res['from'] = trim((isset($d['host']) && is_string($d['host']) ? fm_cut($d['host'], 0, 80) : 'another server') . (isset($d['exported']) && is_string($d['exported']) ? ', exported ' . fm_cut(str_replace('T', ' ', $d['exported']), 0, 16) : '') . (isset($d['app']) && is_string($d['app']) ? ' (version ' . fm_cut($d['app'], 0, 12) . ')' : ''));
+    $flat = fm_settings_flat();
+    $cur = $fm_defaults;
+    foreach ($fm_saved['settings'] as $k => $v) {
+        if (!isset($flat[$k])) continue;
+        list($ok, $v) = fm_setting_clean($k, $flat[$k], $v, false);
+        if ($ok) $cur[$k] = $v;
+    }
+    $eff = $fm_defaults;
+    foreach ($flat as $key => $def) {
+        if (array_key_exists($key, $d['settings'])) {
+            list($ok, $v, $err) = fm_setting_clean($key, $def, $d['settings'][$key], true);
+            if (!$ok) {
+                $res['warnings'][] = $def['label'] . ': ' . rtrim($err, '.') . ', so it stays as it is now.';
+                $v = $cur[$key];
+            }
+            $eff[$key] = $v;
+        } // not in the file = its default (Export only writes what differs from the defaults)
+    }
+    // the same guards as the Settings page, except that an import never switches sign-in off
+    if (!$eff['use_auth']) {
+        $eff['use_auth'] = true;
+        $res['warnings'][] = 'The file switches sign-in off; an import never does that, so sign-in stays on.';
+    }
+    if ($eff['upload_chunk_size_bytes'] > $eff['max_upload_size_bytes']) {
+        $eff['upload_chunk_size_bytes'] = $cur['upload_chunk_size_bytes'];
+        $eff['max_upload_size_bytes'] = $cur['max_upload_size_bytes'];
+        $res['warnings'][] = 'The upload sizes in the file don\'t fit together, so they stay as they are now.';
+    }
+    $ip = fm_client_ip();
+    if (!fm_ip_allowed($ip, $eff['ip_ruleset'], $eff['ip_whitelist'], $eff['ip_blacklist'])) {
+        foreach (array('ip_ruleset', 'ip_whitelist', 'ip_blacklist') as $k) $eff[$k] = $cur[$k];
+        $res['warnings'][] = 'The address rules in the file would block your own address (' . $ip . '), so they stay as they are now.';
+    }
+    $store = array();
+    $show = function ($v) {
+        if (is_bool($v)) return $v ? 'on' : 'off';
+        if (is_array($v)) return count($v) . ' entr' . (count($v) == 1 ? 'y' : 'ies');
+        $v = (string) $v;
+        return $v === '' ? '(empty)' : fm_cut($v, 0, 60);
+    };
+    foreach ($flat as $key => $def) {
+        if ($eff[$key] !== $fm_defaults[$key]) $store[$key] = $eff[$key];
+        if ($eff[$key] !== $cur[$key]) $res['changes'][] = array('label' => $def['label'], 'from' => $show($cur[$key]), 'to' => $show($eff[$key]));
+    }
+    // users: replaced only when the file has them
+    $users = null;
+    $current = fm_users_effective();
+    if (isset($d['users']) && is_array($d['users'])) {
+        $users = array();
+        foreach ($d['users'] as $name => $u) {
+            if (!is_string($name) || !preg_match('/^[A-Za-z0-9._@-]{1,64}$/', $name) || !is_array($u)) {
+                $res['warnings'][] = 'A user with an invalid name was skipped.';
+                continue;
+            }
+            $hash = isset($u['hash']) && is_string($u['hash']) ? $u['hash'] : '';
+            $info = password_get_info($hash);
+            if (empty($info['algo']) || !preg_match('/^\$(2[aby]|argon2id?)\$/', $hash)) {
+                $res['warnings'][] = 'User "' . $name . '" was skipped: its password hash is not recognised.';
+                continue;
+            }
+            $dir = isset($u['dir']) && is_string($u['dir']) ? trim($u['dir']) : '';
+            if ($dir !== '') {
+                list($ok, $dir2) = fm_setting_clean('dir', array('type' => 'path'), $dir, true);
+                if (!$ok) {
+                    $res['warnings'][] = 'User "' . $name . '" was skipped: its own folder ' . fm_cut($dir, 0, 120) . ' doesn\'t exist on this server (without it, the user would become an administrator).';
+                    continue;
+                }
+                $dir = $dir2;
+            }
+            $users[$name] = array('hash' => $hash, 'readonly' => !empty($u['readonly']), 'dir' => $dir);
+        }
+        $admins = array_filter($users, function ($u) {
+            return !$u['readonly'] && $u['dir'] === '';
+        });
+        if (!$admins) {
+            $res['message'] = 'The file has no administrator that can be used on this server (full access, no own folder), so nothing would be imported.';
+            return $res;
+        }
+        foreach ($users as $name => $u) {
+            if (!isset($current[$name])) $res['users']['added'][] = $name;
+            elseif ($u != $current[$name]) $res['users']['changed'][] = $name;
+        }
+        foreach ($current as $name => $u) if (!isset($users[$name])) $res['users']['removed'][] = $name;
+        $me = isset($_SESSION[FM_SESSION_ID]['logged']) ? $_SESSION[FM_SESSION_ID]['logged'] : null;
+        $res['signout'] = FM_USE_AUTH && $me !== null && (!isset($users[$me]) || $users[$me]['hash'] !== $current[$me]['hash'] || $users[$me]['readonly'] || $users[$me]['dir'] !== '');
+    }
+    if (!$apply) {
+        $res['ok'] = true;
+        $res['message'] = $res['changes'] || $res['users']['added'] || $res['users']['removed'] || $res['users']['changed'] ? 'Ready to import.' : 'The file matches what is set now; importing changes nothing.';
+        return $res;
+    }
+    // apply: the signed-in admin confirms with their own password, so a borrowed session can't swap every account
+    if (FM_USE_AUTH) {
+        $me = isset($_SESSION[FM_SESSION_ID]['logged']) ? $_SESSION[FM_SESSION_ID]['logged'] : '';
+        if ($me === '' || !isset($current[$me]) || !password_verify($password, $current[$me]['hash'])) {
+            sleep(1);
+            $res['ok'] = false;
+            $res['message'] = 'Your password is not right, so nothing was imported.';
+            return $res;
+        }
+    }
+    // keep what is there now (owner-only, hidden; the last three are kept)
+    if (is_file($settings_file)) {
+        $bak = dirname($settings_file) . '/settings.before-import-' . date('Ymd-His') . '.php';
+        $mask = @umask(0077);
+        $copied = @copy($settings_file, $bak);
+        @umask($mask);
+        if (!$copied) {
+            $res['ok'] = false;
+            $res['message'] = 'The current settings could not be backed up first, so nothing was imported. Check that the folder of settings.php is writable.';
+            return $res;
+        }
+        @chmod($bak, 0600);
+        $old = glob(dirname($settings_file) . '/settings.before-import-*.php') ?: array();
+        sort($old);
+        foreach (array_slice($old, 0, max(0, count($old) - 3)) as $o) @unlink($o);
+    }
+    if (!fm_settings_write($store, $users !== null ? $users : $fm_saved['users'])) {
+        $res['ok'] = false;
+        $res['message'] = 'Not imported: settings.php can\'t be written. Check the folder\'s permissions.';
+        return $res;
+    }
+    $res['ok'] = true;
+    $res['done'] = true;
+    $res['message'] = 'Imported. The previous settings were saved as ' . (isset($bak) ? basename($bak) : 'nothing (there were none)') . ' next to settings.php.' . ($res['signout'] ? ' Your account changed, so sign in again with an account from the file.' : '');
+    return $res;
+}
+
 function fm_set_msg($msg, $status = 'ok', $log = true)
 {
     if ($status === 'error' && $log) fm_errlog('action', html_entity_decode(strip_tags($msg), ENT_QUOTES, 'UTF-8'));
@@ -10329,7 +10743,7 @@ class FM_Zipper
                         if (!$this->addDir($path . '/' . $file)) {
                             return false;
                         }
-                    } elseif (is_file($path . '/' . $file)) {
+                    } elseif (is_file($path . '/' . $file) && fm_link_inside($path . '/' . $file)) {
                         if (!$this->zip->addFile($path . '/' . $file)) {
                             return false;
                         }
@@ -10433,7 +10847,7 @@ class FM_Zipper_Tar
                         if (!$this->addDir($path . '/' . $file)) {
                             return false;
                         }
-                    } elseif (is_file($path . '/' . $file)) {
+                    } elseif (is_file($path . '/' . $file) && fm_link_inside($path . '/' . $file)) {
                         try {
                             $this->tar->addFile($path . '/' . $file);
                         } catch (Exception $e) {
@@ -12999,6 +13413,14 @@ function fm_show_theme_css()
 
             .fm-copy-items li.is-conflict {
                 background: var(--fm-warning-soft);
+            }
+
+            .fm-copy-items li.is-kept {
+                background: var(--fm-tier);
+            }
+
+            .fm-copy-items li.is-kept .fm-copy-exists {
+                color: var(--fm-muted);
             }
 
             .fm-copy-items li .fm-copy-each {
@@ -18107,6 +18529,177 @@ function fm_show_theme_css()
                 background: var(--fm-danger-solid);
             }
 
+            /* ---- Settings: export / import ---- */
+            .fm-inline-form {
+                display: inline;
+                margin: 0;
+            }
+
+            #fm-imp-modal .modal-title i {
+                margin-right: 4px;
+                color: var(--fm-accent);
+            }
+
+            .fm-imp-drop {
+                position: relative;
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                padding: 16px 18px;
+                border: 1.5px dashed var(--fm-line-strong);
+                border-radius: 12px;
+                background: var(--fm-tier);
+                cursor: pointer;
+            }
+
+            .fm-imp-drop:hover {
+                border-color: var(--fm-accent);
+            }
+
+            .fm-imp-drop > i {
+                color: var(--fm-accent);
+                font-size: 26px;
+            }
+
+            .fm-imp-drop strong,
+            .fm-imp-drop small {
+                display: block;
+            }
+
+            .fm-imp-drop small {
+                color: var(--fm-muted);
+                font-size: 13px;
+            }
+
+            .fm-imp-drop input {
+                position: absolute;
+                inset: 0;
+                opacity: 0;
+                cursor: pointer;
+            }
+
+            .fm-imp-from {
+                margin: 14px 0 10px;
+                color: var(--fm-muted);
+                font-size: 13px;
+            }
+
+            .fm-imp-grid {
+                display: grid;
+                grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+                gap: 16px;
+            }
+
+            .fm-imp-grid h6 {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                margin: 0 0 6px;
+                color: var(--fm-muted);
+                font-size: 13px;
+                font-weight: 600;
+            }
+
+            .fm-imp-list {
+                max-height: 190px;
+                margin: 0;
+                padding: 0;
+                overflow-y: auto;
+                list-style: none;
+                border: 1px solid var(--fm-line);
+                border-radius: 10px;
+                font-size: 13px;
+            }
+
+            .fm-imp-list li {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 4px 8px;
+                padding: 6px 10px;
+            }
+
+            .fm-imp-list li + li {
+                border-top: 1px solid var(--fm-line);
+            }
+
+            .fm-imp-list li span {
+                color: var(--fm-muted);
+                overflow-wrap: anywhere;
+            }
+
+            .fm-imp-list li .fm-env-badge {
+                color: inherit;
+            }
+
+            .fm-imp-none {
+                color: var(--fm-muted);
+            }
+
+            .fm-imp-warn {
+                margin: 12px 0 0;
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: var(--fm-warning-soft);
+                list-style: none;
+                font-size: 13px;
+            }
+
+            .fm-imp-warn i {
+                color: var(--fm-warning);
+            }
+
+            .fm-imp-signout {
+                margin: 10px 0 0;
+                padding: 8px 12px;
+                border-radius: 8px;
+                background: var(--fm-danger-soft);
+                font-size: 13px;
+            }
+
+            .fm-imp-pwd {
+                display: block;
+                max-width: 320px;
+                margin-top: 14px;
+                color: var(--fm-muted);
+                font-size: 13px;
+            }
+
+            .fm-imp-pwd input {
+                margin-top: 4px;
+            }
+
+            .fm-imp-status {
+                margin: 12px 0 0;
+                padding: 8px 12px;
+                border-radius: 8px;
+                font-size: 13.5px;
+            }
+
+            .fm-imp-status.is-busy { background: var(--fm-accent-soft); }
+            .fm-imp-status.is-ok { background: var(--fm-success-soft); }
+            .fm-imp-status.is-error { background: var(--fm-danger-soft); }
+
+            .fm-imp-note {
+                margin-right: auto;
+                color: var(--fm-muted);
+                font-size: 12.5px;
+            }
+
+            .fm-imp-note i {
+                color: var(--fm-success);
+            }
+
+            @media (max-width: 767.98px) {
+                .fm-imp-grid {
+                    grid-template-columns: 1fr;
+                }
+
+                .fm-imp-note {
+                    display: none;
+                }
+            }
+
             /* ---- Error log ---- */
             .fm-errlog {
                 display: flex;
@@ -22159,7 +22752,9 @@ function fm_show_header_login()
             // Which chosen items already exist in the destination (asked again whenever the destination changes)
             function fm_copy_conflicts(path) {
                 fmCopy.conflicts = [];
+                fmCopy.kept = [];
                 $('#js-copy-items .fm-copy-exists').remove();
+                $('#js-copy-items li').removeClass('is-kept');
                 fmCopy.checking = path !== fmCopy.source;
                 fm_copy_validate();
                 if (!fmCopy.checking) return;
@@ -22180,7 +22775,12 @@ function fm_show_header_login()
                 }).done(function(res) {
                     if (fmCopy.dest !== path) return;
                     var data = typeof res === 'string' ? JSON.parse(res) : res;
-                    fmCopy.conflicts = data.conflicts || [];
+                    fmCopy.conflicts = (data.conflicts || []).filter(function(c) {
+                        return !c.kept;
+                    });
+                    fmCopy.kept = (data.conflicts || []).filter(function(c) {
+                        return c.kept;
+                    });
                 }).always(function() {
                     if (fmCopy.dest !== path) return;
                     fmCopy.checking = false;
@@ -22212,7 +22812,16 @@ function fm_show_header_login()
                         name = this.getAttribute('data-name'),
                         hit = fmCopy.conflicts.filter(function(c) {
                             return c.name === name;
-                        })[0];
+                        })[0],
+                        kept = (fmCopy.kept || []).some(function(c) {
+                            return c.name === name;
+                        });
+                    $li.toggleClass('is-kept', kept);
+                    if (kept) {
+                        $li.addClass('is-conflict').find('.fm-copy-exists').remove();
+                        $li.append($('<span class="fm-copy-exists">').attr('title', 'This name belongs to the running file manager (its settings, error log or caches). It is never replaced from here.').text('kept: app file'));
+                        return;
+                    }
                     $li.toggleClass('is-conflict', !!hit);
                     if (!hit) {
                         $li.find('.fm-copy-exists').remove();
@@ -22248,7 +22857,11 @@ function fm_show_header_login()
                     }
                     $sel.val(fm_copy_item_mode(hit));
                 });
-                if (!n) return '';
+                var kn = (fmCopy.kept || []).length,
+                    keptMsg = kn ? ' ' + (fmCopy.kept || []).map(function(c) {
+                        return '"' + c.name + '"';
+                    }).join(', ') + (kn === 1 ? ' belongs' : ' belong') + ' to the running file manager and will be kept.' : '';
+                if (!n) return keptMsg.replace(/^ /, '');
                 var count = {
                         skip: 0,
                         overwrite: 0,
@@ -22268,10 +22881,10 @@ function fm_show_header_login()
                 var used = ['overwrite', 'keep', 'skip'].filter(function(m) {
                     return count[m];
                 });
-                if (used.length === 1) return names + (one ? 'It' : 'They') + ' will ' + said[used[0]] + '.';
+                if (used.length === 1) return names + (one ? 'It' : 'They') + ' will ' + said[used[0]] + '.' + keptMsg;
                 return names + used.map(function(m) {
                     return count[m] + ' will ' + said[m];
-                }).join(', ') + '.';
+                }).join(', ') + '.' + keptMsg;
             }
 
             // Send each item's own choice along, in the same order as file[]

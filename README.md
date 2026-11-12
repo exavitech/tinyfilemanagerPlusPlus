@@ -24,6 +24,7 @@ Drop `tinyfilemanager.php` on a PHP server, open it, create the admin account an
 - Each row shows its default, marks what you changed and can reset it; search across all tabs.
 - No typing of paths or lists: folders and images are picked with a server browser, IP lists, file types, hidden items and editor languages have their own editors with validation and quick-add groups.
 - Users: add and remove, read-only or full access, an own starting folder per user, passwords with a generator.
+- **Export / Import** all settings and users as a .json file, with a preview of the changes and password confirmation: move an install to another server in two clicks.
 
 **Security**
 - **First-run setup** instead of a built-in default password: the first visit creates the admin account.
