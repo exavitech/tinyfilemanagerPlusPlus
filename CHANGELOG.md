@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.7 — Setup check tests the connection to GitHub
+
+- **Setup check › Internet › Connection to GitHub.** Tests what updates need, step by step: name lookup, a
+  connection to port 443, then the HTTPS answer over the updater's own route (curl, PHP sockets or the https
+  wrapper). The first step that fails is named with its likely cause and commands for this server: e.g. PHP can't
+  reach systemd-resolved because its PHP-FPM service is sandboxed (PrivateNetwork, IPAddressDeny…) or chrooted,
+  only one name is filtered, outgoing connections are blocked, or HTTPS fails (proxy, clock, CA certificates).
+- Runs when Setup check or Environment opens (result kept for 10 minutes; **Check again** tests anew). With update
+  checks switched off it never contacts GitHub by itself and offers **Test now** instead.
+
 ## 1.0.6 — updates without curl
 
 - **Check for updates and Update now work without the PHP curl extension.** When curl is missing or switched off,

@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.6
+ * Tiny File Manager++ 1.0.7
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.6');
+define('VERSION', '1.0.7');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -3894,7 +3894,7 @@ if (isset($_GET['setup']) && FM_CAN_CONFIGURE) {
             <div class="fm-env-head-actions">
                 <label class="fm-env-toggle"><input type="checkbox" data-setup-passing> Show passing checks</label>
                 <button type="button" class="btn btn-outline-secondary btn-sm" data-setup-copyall><i class="fa fa-clipboard" aria-hidden="true"></i> Copy all fixes</button>
-                <button type="button" class="btn btn-primary btn-sm" onclick="location.reload()"><i class="fa fa-refresh" aria-hidden="true"></i> Check again</button>
+                <button type="button" class="btn btn-primary btn-sm" onclick="var u = new URL(location.href); u.searchParams.set('recheck', '1'); u.searchParams.delete('net'); location.href = u;"><i class="fa fa-refresh" aria-hidden="true"></i> Check again</button>
             </div>
         </div>
         <div class="fm-setup-layout">
@@ -8175,6 +8175,48 @@ function fm_setup_checks()
         }
     }
 
+    // ---- Internet (updates; Upload from URL also needs it)
+    $g = 'Internet';
+    $want_net = !empty($GLOBALS['update_check']) || isset($_GET['net']) || isset($_GET['recheck']);
+    $svc = $p['service'] !== '' ? $p['service'] : 'php-fpm';
+    $svc_cmd = 'systemctl cat ' . $svc . " | grep -E 'PrivateNetwork|IPAddress|RestrictAddressFamilies|ProtectSystem|InaccessiblePaths|RootDirectory|TemporaryFileSystem'";
+    if (fm_update_can_fetch() === '') {
+        // no way to make requests at all: the curl / disabled-functions rows above already say what to install
+        $add($g, 'Connection to GitHub', 'info', 'not tested', 'This PHP has no way to make HTTPS requests (see the curl row above), so the connection can\'t be tested.');
+    } elseif (!$want_net) {
+        $add($g, 'Connection to GitHub', 'info', 'not tested', 'Update checks are switched off (Settings › Advanced), so this page doesn\'t contact GitHub by itself.', '<a href="?p=&amp;setup=1&amp;net=1">Test the connection now</a>');
+    } else {
+        $n = fm_setup_net(isset($_GET['recheck']) || isset($_GET['net']));
+        $via = array('curl' => 'curl', 'sockets' => 'PHP stream sockets', 'fopen' => 'PHP\'s https wrapper');
+        $route = isset($via[$n['route']]) ? $via[$n['route']] : $n['route'];
+        if ($n['step'] === 'ok') {
+            $add($g, 'Connection to GitHub', 'ok', $n['host'] . ' reached in ' . $n['ms'] . ' ms', 'Updates can be checked and installed (via ' . $route . ').');
+        } elseif ($n['step'] === 'dns') {
+            $why = 'PHP can\'t look up ' . $n['host'] . ' (name lookup / DNS), so Check for updates and Upload from URL fail. ';
+            if (!empty($n['other'])) {
+                $why .= 'Other names resolve (' . $n['other'] . '), so name lookup itself works: only this name fails. Typical causes: DNS filtering (Pi-hole, a provider or company resolver) or a proxy that blocks it.';
+            } elseif ($n['resolv'] === 'unreadable') {
+                $why .= 'PHP can\'t even read /etc/resolv.conf: the PHP-FPM pool probably runs in a chroot, or its service hides /etc.';
+            } elseif ($n['stub']) {
+                $why .= 'This server looks names up through systemd-resolved (127.0.0.53), and PHP can\'t reach it: the PHP service is probably sandboxed (PrivateNetwork, IPAddressDeny, RestrictAddressFamilies, or a hidden /run).';
+            } else {
+                $why .= 'PHP uses the nameservers ' . $n['resolv'] . '.';
+            }
+            if ($n['direct'] === true) $why .= ' A direct DNS query from PHP works, so the network is fine and only the system\'s name lookup is blocked for PHP.';
+            elseif ($n['direct'] === false) $why .= ' A direct DNS query from PHP fails too.';
+            $cmds = array(array('Does the server resolve?', 'getent hosts ' . $n['host']), array('Is PHP\'s service sandboxed?', $svc_cmd));
+            if ($p['master'] !== '') $cmds[] = array('Is the pool in a chroot?', "grep -RnE '^\\s*chroot\\s*=' " . escapeshellarg(dirname($p['master'])));
+            $cmds[] = array('Then', 'sudo systemctl daemon-reload && ' . (fm_setup_restart($p) ?: 'sudo systemctl restart ' . $svc));
+            $add($g, 'Connection to GitHub', 'warn', 'name lookup fails', $why, 'If the server resolves but PHP doesn\'t: remove those sandbox lines with <code>sudo systemctl edit ' . fm_enc($svc) . '</code> (or copy <code>/etc/resolv.conf</code>, <code>/etc/hosts</code> and <code>/etc/nsswitch.conf</code> into the chroot), then restart it. If the server doesn\'t resolve either, fix its DNS first (<code>resolvectl status</code>).', $cmds);
+        } elseif ($n['step'] === 'connect') {
+            $add($g, 'Connection to GitHub', 'warn', 'no connection to ' . $n['ip'] . ':' . $n['port'], 'The name ' . $n['host'] . ' resolves (' . $n['ip'] . '), but PHP can\'t connect to it (' . $n['detail'] . '). Outgoing connections are blocked: a firewall, the provider, or IPAddressDeny on PHP\'s service.',
+                'Allow outgoing HTTPS for this server (and check PHP\'s service), then restart PHP:', array(array('From the server itself', 'curl -sI https://' . $n['host'] . ' | head -1'), array('Firewall (ufw)', 'sudo ufw allow out ' . (int) $n['port'] . '/tcp'), array('PHP\'s service', $svc_cmd)));
+        } else {
+            $add($g, 'Connection to GitHub', 'warn', 'HTTPS fails', 'PHP connects to ' . $n['host'] . ' but the HTTPS request fails (' . $n['detail'] . '). Typical causes: a proxy that intercepts HTTPS, a clock that is far off (certificates), or missing CA certificates.',
+                'Check the clock and the CA certificates:', array(array('Clock', 'timedatectl'), array('CA certificates', fm_setup_os_pkg($p, array('debian' => 'ca-certificates', 'rhel' => 'ca-certificates', 'alpine' => 'ca-certificates'))), array('From the server itself', 'curl -sI https://' . $n['host'] . ' | head -1')));
+        }
+    }
+
     // ---- Access
     $g = 'Access';
     if (!FM_USE_AUTH) $add($g, 'Sign-in', 'fail', 'off', 'Anyone who can open this page has full access to the files.', 'Switch on Settings › Access › Require sign-in.');
@@ -8187,12 +8229,70 @@ function fm_setup_checks()
     return $c;
 }
 
+/**
+ * Can PHP reach GitHub (updates)? Name lookup, then a connection to port 443, then the HTTPS answer over the
+ * updater's own route. Stops at the first step that fails and records what PHP can see about name lookup.
+ * Cached for 10 minutes in the session (Setup check and Environment render it); $force runs it again.
+ */
+function fm_setup_net($force = false)
+{
+    $key = 'setup_net';
+    if (!$force && isset($_SESSION[FM_SESSION_ID][$key]['t']) && time() - $_SESSION[FM_SESSION_ID][$key]['t'] < 600) return $_SESSION[FM_SESSION_ID][$key];
+    $src = fm_update_source();
+    $host = (string) parse_url($src['api'], PHP_URL_HOST);
+    $port = (int) parse_url($src['api'], PHP_URL_PORT) ?: ($src['scheme'] === 'https' ? 443 : 80);
+    $r = array('t' => time(), 'step' => 'ok', 'host' => $host, 'port' => $port, 'ip' => '', 'detail' => '', 'ms' => 0, 'resolv' => '', 'stub' => false, 'direct' => null, 'route' => fm_update_can_fetch());
+    $t0 = microtime(true);
+    // 1. name lookup, the way every PHP connection does it (getaddrinfo: /etc/nsswitch.conf, /etc/resolv.conf, systemd-resolved)
+    $ip = function_exists('gethostbyname') && !fm_fn_disabled('gethostbyname') ? @gethostbyname($host) : '';
+    if ($ip === '' || $ip === $host || !filter_var($ip, FILTER_VALIDATE_IP)) {
+        $r['step'] = 'dns';
+        // does any name resolve? (only this one failing = filtering or a typo, not PHP's lookup as a whole)
+        $probe = $host === 'github.com' ? 'www.github.com' : 'github.com';
+        $other = @gethostbyname($probe);
+        $r['other'] = $other !== $probe && filter_var($other, FILTER_VALIDATE_IP) ? $probe : '';
+        $rc = @file_get_contents('/etc/resolv.conf');
+        if ($rc === false) {
+            $r['resolv'] = 'unreadable';
+        } else {
+            $ns = preg_match_all('/^\s*nameserver\s+(\S+)/m', $rc, $m) ? $m[1] : array();
+            $r['resolv'] = $ns ? implode(', ', $ns) : 'no nameserver lines';
+            $r['stub'] = in_array('127.0.0.53', $ns, true);
+        }
+        // a direct DNS query (bypasses nsswitch): tells "PHP can't use the system's lookup" from "no DNS at all"
+        if (function_exists('dns_get_record') && !fm_fn_disabled('dns_get_record')) $r['direct'] = (bool) @dns_get_record($host, DNS_A);
+    } else {
+        $r['ip'] = $ip;
+        // 2. a plain connection to that address
+        if (function_exists('stream_socket_client') && !fm_fn_disabled('stream_socket_client')) {
+            $fh = @stream_socket_client('tcp://' . $ip . ':' . $port, $en, $es, 5);
+            if (!$fh) {
+                $r['step'] = 'connect';
+                $r['detail'] = trim((string) $es) !== '' ? trim($es) : 'no answer';
+            } else {
+                fclose($fh);
+            }
+        }
+        // 3. the answer, over the route the updater uses
+        if ($r['step'] === 'ok') {
+            list($code, , $err) = fm_update_http($src['api'], 4194304);
+            if ($code !== 200) {
+                $r['step'] = 'https';
+                $r['detail'] = $err !== '' ? $err : 'HTTP ' . $code;
+            }
+        }
+    }
+    $r['ms'] = (int) round((microtime(true) - $t0) * 1000);
+    $_SESSION[FM_SESSION_ID][$key] = $r;
+    return $r;
+}
+
 /** The checks as HTML: groups of rows; rows that need something open to the fix and its commands */
 function fm_setup_render($checks, $compact = false)
 {
     $icon = array('ok' => 'fa-check-circle', 'fail' => 'fa-times-circle', 'warn' => 'fa-exclamation-triangle', 'info' => 'fa-info-circle');
     $label = array('ok' => 'OK', 'fail' => 'Fix needed', 'warn' => 'Limited', 'info' => 'Note');
-    $gicon = array('PHP' => 'fa-code', 'PHP settings' => 'fa-sliders', 'Files and folders' => 'fa-folder-open-o', 'Web server' => 'fa-globe', 'Environment page' => 'fa-server', 'Access' => 'fa-lock');
+    $gicon = array('PHP' => 'fa-code', 'PHP settings' => 'fa-sliders', 'Files and folders' => 'fa-folder-open-o', 'Web server' => 'fa-globe', 'Environment page' => 'fa-server', 'Internet' => 'fa-cloud', 'Access' => 'fa-lock');
     $groups = array();
     foreach ($checks as $c) $groups[$c['group']][] = $c;
     $h = '<div class="fm-setup' . ($compact ? ' is-compact' : '') . '">';
