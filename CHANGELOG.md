@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.0.8 — PHP 8.5, private-file check
+
+- **PHP 8.5:** `curl_close()` (a no-op since PHP 8.0, deprecated in 8.5) is no longer called. With PHP errors shown,
+  its notice was printed into the update check's answer and broke it ("The check did not finish").
+- **Notices can't break the app any more:** deprecation notices are written to the Error log and never printed, and
+  ajax/JSON answers never contain printed warnings. If an answer still can't be read, the update dialog shows what
+  the server sent.
+- **Setup check › Private files:** requests settings.php and the error log through the web server as a visitor would.
+  If either comes back as source (a web server that hands out .php files as text), the row turns red with the fix
+  for this server (nginx lines with its PHP-FPM socket, or Apache), and suggests keeping settings.php outside the
+  web folder (TFMPP_SETTINGS).
+- **Setup check › PHP errors in pages:** a note when PHP prints its errors into pages.
+- Tested on PHP 8.5.12.
+
 ## 1.0.7 — Setup check tests the connection to GitHub
 
 - **Setup check › Internet › Connection to GitHub.** Tests what updates need, step by step: name lookup, a

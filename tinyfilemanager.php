@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.7
+ * Tiny File Manager++ 1.0.8
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.7');
+define('VERSION', '1.0.8');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -125,6 +125,10 @@ function fm_errlog_php($no, $str, $file, $line)
     if (!(error_reporting() & $no)) return false;
     $lv = array(E_WARNING => 'warning', E_USER_WARNING => 'warning', E_NOTICE => 'notice', E_USER_NOTICE => 'notice', E_DEPRECATED => 'notice', E_USER_DEPRECATED => 'notice', E_RECOVERABLE_ERROR => 'error', E_USER_ERROR => 'error');
     fm_errlog('php', $str, basename($file) . ':' . $line, isset($lv[$no]) ? $lv[$no] : 'error', 300);
+    // deprecations (e.g. after a PHP upgrade) are for the developers: in the log, never in the page
+    if ($no === E_DEPRECATED || $no === E_USER_DEPRECATED) return true;
+    // ajax / JSON answers: a printed warning would break them (a button that "did not finish"); it is in the log
+    if (isset($_POST['ajax']) || isset($_GET['ajax']) || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower((string) $_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest')) return true;
     return false; // PHP's own handling (display / server log) continues as configured
 }
 
@@ -1315,7 +1319,7 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 }
                 ftruncate($fp, 0);
                 rewind($fp);
-                if ($ch) curl_close($ch);
+                if ($ch && PHP_VERSION_ID < 80000) curl_close($ch); // a no-op since PHP 8.0, deprecated in 8.5
                 $ch = curl_init($target['url']);
                 curl_setopt($ch, CURLOPT_RESOLVE, array($target['host'] . ':' . $target['port'] . ':' . (strpos($target['ip'], ':') !== false ? '[' . $target['ip'] . ']' : $target['ip'])));
                 // connect to the checked address whatever host name curl ends up with, before anything is sent
@@ -1375,7 +1379,7 @@ if ((isset($_SESSION[FM_SESSION_ID]['logged'], $auth_users[$_SESSION[FM_SESSION_
                 }
                 $err = array("message" => $msg);
             }
-            if ($ch) @curl_close($ch);
+            if ($ch && PHP_VERSION_ID < 80000) curl_close($ch); // a no-op since PHP 8.0, deprecated in 8.5
             fclose($fp);
             $fileinfo->size = isset($curl_info) ? $curl_info["size_download"] : 0;
             $fileinfo->type = isset($curl_info) ? $curl_info["content_type"] : '';
@@ -6580,7 +6584,7 @@ function fm_update_http($url, $max = 10485760)
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $next = (string) curl_getinfo($ch, CURLINFO_REDIRECT_URL);
         $err = curl_error($ch);
-        curl_close($ch);
+        if (PHP_VERSION_ID < 80000) curl_close($ch); // a no-op since PHP 8.0, deprecated in 8.5
         if ($too_big) return array(0, '', 'the download was larger than expected');
         if ($ok === false) return array(0, '', 'GitHub could not be reached (' . $err . ')');
         if ($code >= 300 && $code < 400 && $next !== '') {
@@ -6739,29 +6743,24 @@ function fm_update_replace($code)
 /**
  * Request this file once from the web server, as a fresh visitor, and expect "tfmpp-ok <version>"
  */
-function fm_update_selftest($want)
+/**
+ * Request one of this site's own URLs from the web server, by its address, as a fresh visitor (no cookies).
+ * $pathq: absolute path + query ("/tfm/settings.php"). Uses curl, or stream sockets / the https wrapper.
+ * @return array [http code, body, error]
+ */
+function fm_self_request($pathq, $max = 262144)
 {
-    $nonce = bin2hex(random_bytes(16));
-    $nf = fm_update_nonce_file();
-    if (is_link($nf) || @file_put_contents($nf, $nonce, LOCK_EX) !== 32) return 'the self-test could not be prepared (the settings folder is not writable)';
     $https = !empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off';
     $addr = !empty($_SERVER['SERVER_ADDR']) ? (string) $_SERVER['SERVER_ADDR'] : '127.0.0.1';
-    if (strpos($addr, ':') !== false) $addr = '[' . $addr . ']';
     $port = !empty($_SERVER['SERVER_PORT']) ? (int) $_SERVER['SERVER_PORT'] : ($https ? 443 : 80);
-    $path = !empty($_SERVER['SCRIPT_NAME']) ? (string) $_SERVER['SCRIPT_NAME'] : '/' . basename(__FILE__);
     $host = preg_replace('/[^A-Za-z0-9.:\[\]-]/', '', isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : 'localhost');
+    $bare = trim($addr, '[]');
+    $url = ($https ? 'https' : 'http') . '://' . (strpos($bare, ':') !== false ? '[' . $bare . ']' : $bare) . ':' . $port . $pathq;
     if (!function_exists('curl_init') || fm_fn_disabled('curl_exec')) {
-        // no curl: ask this server over a socket, by address, with the site's host name (this server: no certificate check)
-        list($code, $h, $body, $err) = fm_http_get(($https ? 'https' : 'http') . '://' . trim($addr, '[]') . ':' . $port . $path . '?fm_update_ping=' . $nonce, array('Host: ' . $host), 65536, false, trim($addr, '[]'));
-        @unlink($nf);
-        if ($err !== '') return 'the self-test could not reach this web server (' . $err . ')';
-        if ($code !== 200 || trim((string) $body) !== 'tfmpp-ok ' . $want) {
-            $said = trim(preg_replace('/\s+/', ' ', strip_tags((string) $body)));
-            return 'the new version did not start correctly (HTTP ' . $code . ($said !== '' ? ': ' . substr($said, 0, 160) : '') . ')';
-        }
-        return '';
+        list($code, , $body, $err) = fm_http_get($url, array('Host: ' . $host), $max, false, $bare);
+        return array($code, $body, $err);
     }
-    $ch = curl_init(($https ? 'https' : 'http') . '://' . $addr . ':' . $port . $path . '?fm_update_ping=' . $nonce);
+    $ch = curl_init($url);
     curl_setopt_array($ch, array(
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => false,
@@ -6774,9 +6773,19 @@ function fm_update_selftest($want)
     $body = curl_exec($ch);
     $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
     $err = curl_error($ch);
-    curl_close($ch);
+    if (PHP_VERSION_ID < 80000) curl_close($ch);
+    return array($body === false ? 0 : $code, $body === false ? '' : (string) substr((string) $body, 0, $max), $body === false ? ($err !== '' ? $err : 'no answer') : '');
+}
+
+function fm_update_selftest($want)
+{
+    $nonce = bin2hex(random_bytes(16));
+    $nf = fm_update_nonce_file();
+    if (is_link($nf) || @file_put_contents($nf, $nonce, LOCK_EX) !== 32) return 'the self-test could not be prepared (the settings folder is not writable)';
+    $path = !empty($_SERVER['SCRIPT_NAME']) ? (string) $_SERVER['SCRIPT_NAME'] : '/' . basename(__FILE__);
+    list($code, $body, $err) = fm_self_request($path . '?fm_update_ping=' . $nonce, 65536);
     @unlink($nf);
-    if ($body === false) return 'the self-test could not reach this web server (' . $err . ')';
+    if ($err !== '') return 'the self-test could not reach this web server (' . $err . ')';
     if ($code !== 200 || trim((string) $body) !== 'tfmpp-ok ' . $want) {
         $said = trim(preg_replace('/\s+/', ' ', strip_tags((string) $body)));
         return 'the new version did not start correctly (HTTP ' . $code . ($said !== '' ? ': ' . substr($said, 0, 160) : '') . ')';
@@ -8063,6 +8072,10 @@ function fm_setup_checks()
     } else {
         $add($g, 'Disabled functions', 'ok', $disabled ? count($disabled) . ' disabled, none the app needs' : 'none', 'Every function the file manager uses is available.');
     }
+    $de = strtolower((string) ini_get('display_errors'));
+    if ($de !== '' && $de !== '0' && $de !== 'off' && $de !== 'stderr') {
+        $add($g, 'PHP errors in pages', 'info', 'shown', 'PHP warnings are printed into the pages: they can reveal server paths, and show up as stray text (for example after a PHP upgrade). They are also recorded in the Error log, so showing them is only needed while troubleshooting.', !empty($GLOBALS['report_errors']) ? 'Switch off Settings › Access › Show PHP errors.' : 'Set <code>display_errors = Off</code> in ' . ($p['ini'] !== '' ? '<code>' . fm_enc($p['ini']) . '</code>' : 'php.ini') . ', then restart PHP.');
+    }
     if (ini_get('opcache.enable') && !ini_get('opcache.validate_timestamps')) {
         $add($g, 'OPcache file checks', 'info', 'validate_timestamps = 0', 'The app refreshes its own files after Settings and updates, but files you change by hand only take effect after a PHP restart.', '', array(array('After editing by hand', $restart)));
     }
@@ -8075,6 +8088,33 @@ function fm_setup_checks()
         $sok ? '' : 'Let the PHP user (<code>' . fm_enc($p['user']) . '</code>) write the folder and the file:', $sok ? array() : array(array('Fix', 'sudo chown ' . $p['user'] . ' ' . escapeshellarg($sdir) . (@file_exists($GLOBALS['settings_file']) ? ' ' . escapeshellarg($GLOBALS['settings_file']) : ''))));
     if (@is_file($GLOBALS['settings_file']) && (@fileperms($GLOBALS['settings_file']) & 0044)) {
         $add($g, 'Settings file privacy', 'warn', sprintf('%04o', @fileperms($GLOBALS['settings_file']) & 0777), 'settings.php holds the password hashes of every user, and other accounts on this server can read it.', 'Make it readable by its owner only:', array(array('Fix', 'sudo chmod 600 ' . escapeshellarg($GLOBALS['settings_file']))));
+    }
+    // the private files must not be downloadable through the web server
+    $ex = fm_setup_exposure(isset($_GET['recheck']));
+    $bad = $unt = array();
+    foreach ($ex as $e) {
+        if ($e[2] === 'exposed') $bad[] = $e;
+        elseif ($e[2] === 'untested') $unt[] = $e;
+    }
+    if ($bad) {
+        $sock = '';
+        foreach (fm_env_fpm_pools() as $pl) if ($p['pool'] !== '' && $pl['name'] === $p['pool'] && $pl['listen'] !== '') $sock = $pl['listen'];
+        $pass = $sock === '' ? 'unix:/run/php/php' . $p['php'] . '-fpm.sock' : (strpos($sock, '/') === 0 ? 'unix:' . $sock : $sock);
+        $names = array();
+        foreach ($bad as $e) $names[] = $e[0] . ' (' . $e[3] . ')';
+        $nginx = stripos($p['web'], 'nginx') !== false;
+        $add($g, 'Private files', 'fail', 'downloadable: ' . implode(', ', array_map(function ($e) { return $e[0]; }, $bad)),
+            'The web server hands out ' . implode(' and ', $names) . ' as text instead of running ' . (count($bad) > 1 ? 'them' : 'it') . ' through PHP, so anyone who knows the address can read ' . (count($bad) > 1 ? 'them' : 'it') . ($bad[0][0] === 'settings.php' ? ', including every user\'s password hash' : '') . '.',
+            $nginx ? 'In this site\'s nginx <code>server { }</code> block, refuse these files and let PHP run every other <code>.php</code> file (the deny line goes first), then reload nginx. Even better: keep settings.php outside the web folder with the <code>TFMPP_SETTINGS</code> environment variable.'
+                   : 'Make the web server run every .php file through PHP and refuse these files (e.g. Apache: a FilesMatch block with Require all denied). Even better: keep settings.php outside the web folder with the <code>TFMPP_SETTINGS</code> environment variable.',
+            $nginx ? array(array('Lines', "location ~ /(settings|tfmpp-errors|tfmpp-errors\\.1|settings\\.before-import-[^/]*)\\.php$ { deny all; }\nlocation ~ \\.php$ {\n    try_files \$uri =404;\n    include fastcgi_params;\n    fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;\n    fastcgi_pass " . $pass . ";\n}"), array('Then', 'sudo nginx -t && sudo ' . ($p['systemd'] ? 'systemctl reload nginx' : 'rc-service nginx reload')))
+                   : array(array('Apache', "<FilesMatch \"^(settings|tfmpp-errors(\\.1)?|settings\\.before-import-.*)\\.php$\">\n    Require all denied\n</FilesMatch>")));
+    } elseif ($unt) {
+        $add($g, 'Private files', 'info', 'not tested', 'This server could not be asked for its own files (' . $unt[0][3] . '), so it is unknown whether settings.php can be downloaded. Open it in a browser: a blank page or "not found" is right; text with password hashes is not.');
+    } else {
+        $where = array();
+        foreach ($ex as $e) if ($e[2] !== 'absent') $where[] = $e[0] . ($e[2] === 'outside' ? ' outside the web folder' : ': ' . $e[3]);
+        $add($g, 'Private files', 'ok', $where ? implode(' · ', $where) : 'not created yet', 'settings.php and the error log can\'t be downloaded through the web server.');
     }
     $self_ok = @is_writable(__FILE__) && @is_writable(dirname(__FILE__));
     $add($g, 'Self-update', $self_ok ? 'ok' : 'info', basename(__FILE__) . ' in ' . dirname(__FILE__), $self_ok ? 'Updates can be installed from the account menu.' : 'Updates must be installed by hand (PHP may not replace ' . basename(__FILE__) . '). That is also a safe choice.',
@@ -8285,6 +8325,47 @@ function fm_setup_net($force = false)
     $r['ms'] = (int) round((microtime(true) - $t0) * 1000);
     $_SESSION[FM_SESSION_ID][$key] = $r;
     return $r;
+}
+
+/**
+ * Can a visitor download the app's private files (settings.php with the password hashes, the error log)?
+ * Each one inside the web folder is requested from the web server as a stranger would; PHP source in the answer
+ * means the web server hands PHP files out as text. Cached for 10 minutes in the session; $force tests again.
+ * @return array of [label, path, state safe|exposed|outside|untested|absent, detail]
+ */
+function fm_setup_exposure($force = false)
+{
+    $key = 'setup_exposure';
+    if (!$force && isset($_SESSION[FM_SESSION_ID][$key]['t']) && time() - $_SESSION[FM_SESSION_ID][$key]['t'] < 600) return $_SESSION[FM_SESSION_ID][$key]['r'];
+    $sdir = realpath(dirname(isset($_SERVER['SCRIPT_FILENAME']) ? (string) $_SERVER['SCRIPT_FILENAME'] : __FILE__));
+    $sweb = rtrim(str_replace('\\', '/', dirname(isset($_SERVER['SCRIPT_NAME']) ? (string) $_SERVER['SCRIPT_NAME'] : '/')), '/');
+    $droot = !empty($_SERVER['DOCUMENT_ROOT']) ? realpath((string) $_SERVER['DOCUMENT_ROOT']) : false;
+    $out = array();
+    foreach (array('settings.php' => $GLOBALS['settings_file'], 'the error log' => fm_errlog_file()) as $label => $file) {
+        $real = realpath($file);
+        if ($real === false) {
+            $out[] = array($label, $file, 'absent', '');
+            continue;
+        }
+        $url = null;
+        if ($sdir !== false && strpos($real, $sdir . '/') === 0) $url = $sweb . '/' . substr($real, strlen($sdir) + 1);
+        elseif ($droot !== false && strpos($real, rtrim($droot, '/') . '/') === 0) $url = '/' . substr($real, strlen(rtrim($droot, '/')) + 1);
+        if ($url === null) {
+            $out[] = array($label, $real, 'outside', '');
+            continue;
+        }
+        $url = implode('/', array_map('rawurlencode', explode('/', $url)));
+        list($code, $body, $err) = fm_self_request($url, 65536);
+        if ($err !== '') {
+            $out[] = array($label, $real, 'untested', $err);
+        } elseif ($code === 200 && (strpos($body, '<?php') !== false || preg_match('/\'hash\'\s*=>|"k":"/', $body))) {
+            $out[] = array($label, $real, 'exposed', $url);
+        } else {
+            $out[] = array($label, $real, 'safe', 'HTTP ' . $code . ($code === 200 ? ', empty: PHP ran it' : ''));
+        }
+    }
+    $_SESSION[FM_SESSION_ID][$key] = array('t' => time(), 'r' => $out);
+    return $out;
 }
 
 /** The checks as HTML: groups of rows; rows that need something open to the fix and its commands */
@@ -22187,10 +22268,11 @@ function fm_show_header_login()
                     post('update_check', {force: force ? '1' : ''}).done(function(d) {
                         mark(d);
                         if (open) show(d);
-                    }).fail(function() {
+                    }).fail(function(xhr) {
                         if (open) {
                             button('check', 'Check for updates');
-                            show({ok: false, message: 'The check did not finish. Reload the page and try again.'});
+                            var said = xhr && xhr.responseText ? String(xhr.responseText).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+                            show({ok: false, message: 'The check did not finish' + (said ? '. The server answered: "' + said + '"' : '') + '. Reload the page and try again; Error log in the account menu has the details.'});
                         }
                     }).always(function() {
                         busy = false;
