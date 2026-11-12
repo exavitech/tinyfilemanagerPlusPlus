@@ -3,7 +3,7 @@
 $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":false,"theme":"light"}';
 
 /**
- * Tiny File Manager++ 1.0.9
+ * Tiny File Manager++ 1.0.10
  * A fork of H3K ~ Tiny File Manager V2.6 by CCP Programmers
  * @github https://github.com/prasathmani/tinyfilemanager (original)
  * @github https://github.com/exavitech/tinyfilemanagerPlusPlus (this fork)
@@ -12,7 +12,7 @@ $CONFIG = '{"lang":"en","error_reporting":false,"show_hidden":true,"hide_Cols":f
  */
 
 // version
-define('VERSION', '1.0.9');
+define('VERSION', '1.0.10');
 
 // Hardened hosts list functions in disable_functions. Since PHP 8 a disabled function doesn't exist, so calling it
 // is a fatal error (an @ doesn't help) and the whole app would stop. These stand-ins return what the real function
@@ -6299,9 +6299,8 @@ function fm_place_item($from, $dest_dir, $dest_rel, $move, $conflict)
     if (is_dir($from) && !is_link($from) && strpos(rtrim($dest_dir, '/') . '/', $from . '/') === 0) {
         return array('status' => 'failed', 'name' => $name, 'why' => 'a folder can\'t go inside itself');
     }
-    if ($move && !is_dir($from) && !fm_is_valid_ext($name)) {
-        return array('status' => 'failed', 'name' => $name, 'why' => 'this file type is not allowed');
-    }
+    // No file-type check here: a move keeps the name, so it creates no new type (copy and folder moves never checked).
+    // "Allowed types when creating or renaming" is enforced where a name is chosen (create, rename, upload).
     $exists = file_exists($dest) || is_link($dest);
     if (fm_own_file($dest)) {
         // settings.php, the error log, caches: they belong to the running file manager and are never written from here

@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.10 — Move keeps every file type
+
+- **Move no longer refuses files by type.** With *Allowed types when creating or renaming* set (e.g. `php`), moving
+  files failed with "this file type is not allowed" for every other type (`.md`, `.jar`, `LICENSE`, `.gitignore`…),
+  while folders and Copy went through. A move keeps the file's name, so it creates no new type; the setting still
+  applies where a name is chosen (new file, rename).
+
 ## 1.0.9 — update dialog confirms the result
 
 - When the answer to **Update now** or **Roll back** can't be read (for example a notice printed by the version
